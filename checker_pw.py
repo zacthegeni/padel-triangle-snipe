@@ -83,7 +83,8 @@ def _take_debug(page, name="shot"):
     except Exception:
         pass
 
-TIME_RANGE_RE = re.compile(r"\b([01]\d|2[0-3]):[0-5]\d\s*-\s*([01]\d|2[0-3]):[0-5]\d\b", re.I)
+TIME_RANGE_RE = re.compile(r"\b([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\b", re.I)
+TIME_HHMM_RE  = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 def _dismiss_cookies(page):
     for label in ("Accept", "I agree", "Allow all", "Accept all", "OK"):
@@ -104,7 +105,6 @@ def _robust_wait_gladstone(page):
      - an 'unavailable' badge appears
      - any time-range text like '06:00 - 07:00' is in DOM
     """
-    # Wait for network to settle
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except PWTimeoutError:
@@ -112,29 +112,24 @@ def _robust_wait_gladstone(page):
 
     _dismiss_cookies(page)
 
-    # Try to wait for a heading (often 'Padel Tennis')
     try:
         head = page.get_by_role("heading")
         head.first.wait_for(timeout=8000)
     except Exception:
         pass
 
-    # Poll for content signals up to ~12s
     deadline = dt.datetime.now() + dt.timedelta(seconds=12)
     while dt.datetime.now() < deadline:
         try:
-            # any book-ish button?
             if page.get_by_role("button", name=re.compile(r"(book|add to basket|reserve|add)", re.I)).count():
                 return True
         except Exception:
             pass
         try:
-            # any 'unavailable' badge?
             if page.get_by_text(re.compile(r"this slot is unavailable", re.I)).count():
                 return True
         except Exception:
             pass
-        # any time range present in the whole page text?
         try:
             body_txt = page.locator("body").inner_text(timeout=1000)
             if TIME_RANGE_RE.search(body_txt):
@@ -142,7 +137,6 @@ def _robust_wait_gladstone(page):
         except Exception:
             pass
 
-        # nudge: small scroll to trigger lazy load
         try:
             page.evaluate("window.scrollBy(0, 600)")
         except Exception:
@@ -152,10 +146,14 @@ def _robust_wait_gladstone(page):
     return False
 
 def _parse_day_slots(page, day_dt: dt.date):
+    """
+    From a Gladstone day view, extract available slots with a real button,
+    ignore 'This slot is unavailable'. Returns [(weekday, 'HH:MM', 'Padel Tennis'), ...]
+    """
     cards = page.locator("div").filter(has_text=re.compile(r"\b\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\b"))
     out = []
-
     n = min(cards.count(), 400)
+
     for i in range(n):
         c = cards.nth(i)
         txt = _safe_text(c)
@@ -167,7 +165,9 @@ def _parse_day_slots(page, day_dt: dt.date):
         m = TIME_RANGE_RE.search(txt)
         if not m:
             continue
-        start_hm = m.group(1)
+        start_hm = f"{m.group(1)}:{m.group(2)}"
+        if not TIME_HHMM_RE.match(start_hm):
+            continue
         if not _within_filters(day_dt, start_hm):
             continue
 
@@ -206,7 +206,6 @@ def _visit_and_collect_for_date(page, d: dt.date):
 
     slots = _load_once()
     if not slots:
-        # One controlled retry (hard refresh)
         try:
             page.reload(timeout=30000, wait_until="domcontentloaded")
         except Exception:
@@ -214,7 +213,18 @@ def _visit_and_collect_for_date(page, d: dt.date):
         ok = _robust_wait_gladstone(page)
         if ok:
             slots = _parse_day_slots(page, d)
+    print(f"[debug] {d.isoformat()} -> {len(slots)} slots parsed")
     return slots
+
+def _safe_sort_key(day_order, tup):
+    """Return a sort key; if time is malformed, send it to the end safely."""
+    dname, hm, act = tup
+    try:
+        hh = int(hm[:2])
+        mm = int(hm[3:5])
+    except Exception:
+        return (day_order.get(dname, 99), 99, 99, act or "")
+    return (day_order.get(dname, 99), hh, mm, act or "")
 
 def _collect_slots():
     today = dt.date.today()
@@ -238,17 +248,21 @@ def _collect_slots():
             ctx.close()
             browser.close()
 
-    # Deduplicate and sort
+    # Deduplicate and sort (guard against any bad time strings)
     seen = set()
     unique = []
     day_order = { (today + dt.timedelta(days=i)).strftime("%A"): i for i in range(8) }
     for dname, hm, act in all_slots:
-        key = (dname, hm, act.lower())
+        if not (isinstance(hm, str) and TIME_HHMM_RE.match(hm)):
+            # Skip malformed times entirely
+            continue
+        key = (dname, hm, (act or "").lower())
         if key in seen:
             continue
         seen.add(key)
-        unique.append((dname, hm, act))
-    unique.sort(key=lambda x: (day_order.get(x[0], 99), int(x[1][:2]), int(x[1][3:5]), x[2]))
+        unique.append((dname, hm, act or ""))
+
+    unique.sort(key=lambda x: _safe_sort_key(day_order, x))
     return unique
 
 # ----------------- Main -----------------
