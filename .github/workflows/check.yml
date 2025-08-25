@@ -2,7 +2,7 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/1 * * * *"   # every minute
   workflow_dispatch: {}
 
 jobs:
@@ -28,16 +28,21 @@ jobs:
           pwd
           ls -la
 
-      - name: Check padel timetable (Playwright)
+      - name: Check padel timetable (Gladstone direct)
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          EARLIEST_HOUR: "18"
-          LATEST_HOUR:   "22"
-          DAYS_AHEAD:    "2"
+
+          # Wide defaults; tune as you like
+          EARLIEST_HOUR: "0"
+          LATEST_HOUR:   "24"
+          DAYS_AHEAD:    "7"
           WEEKENDS_OK:   "true"
           WEEKDAYS_OK:   "true"
-          ACTIVITY_NAME: "Padel"
+
+          # Gladstone calendar config
+          ACTIVITY_ID:  "149A001015"  # Padel Tennis @ The Triangle
+          START_HOUR_Z: "5"           # builds ...T05:00:00.000Z in the URL
         run: python checker_pw.py
 
       - name: Upload debug screenshots (if any)
