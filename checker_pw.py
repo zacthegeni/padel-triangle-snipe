@@ -2,12 +2,12 @@ import os, re, sys, traceback
 import datetime as dt
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import requests
 
 # ----------------- Config (env-driven) -----------------
 GLAD_BASE     = "https://placesleisure.gladstonego.cloud/book/calendar"
-# Padel Tennis @ The Triangle Activity ID (stable as of now)
+# Padel Tennis @ The Triangle Activity ID
 ACTIVITY_ID   = os.getenv("ACTIVITY_ID", "149A001015").strip()
 
 # The Gladstone URL wants a UTC timestamp like 05:00Z that maps to local morning.
@@ -50,7 +50,6 @@ def tg_send(msg: str):
 
 # ----------------- Helpers -----------------
 def _zstamp_for_date(d: dt.date) -> str:
-    # Build YYYY-MM-DDT{START_HOUR_Z}:00:00.000Z
     return f"{d.isoformat()}T{START_HOUR_Z:02d}:00:00.000Z"
 
 def _within_filters(day_dt: dt.date, start_hhmm: str) -> bool:
@@ -69,10 +68,10 @@ def _within_filters(day_dt: dt.date, start_hhmm: str) -> bool:
 
 def _safe_text(el) -> str:
     try:
-        return (el.inner_text(timeout=800) or "").strip()
+        return (el.inner_text(timeout=1000) or "").strip()
     except Exception:
         try:
-            return (el.text_content(timeout=800) or "").strip()
+            return (el.text_content(timeout=1000) or "").strip()
         except Exception:
             return ""
 
@@ -86,120 +85,71 @@ def _take_debug(page, name="shot"):
 
 TIME_RANGE_RE = re.compile(r"\b([01]\d|2[0-3]):[0-5]\d\s*-\s*([01]\d|2[0-3]):[0-5]\d\b", re.I)
 
-def _parse_day_slots(page, day_dt: dt.date):
-    """
-    We are on a Gladstone 'calendar/{ACTIVITY_ID}?activityDate=...&previousActivityDate=...' page.
-    Extract visible cards with a real booking button and without 'This slot is unavailable'.
-    Returns list of (weekday, HH:MM, 'Padel Tennis').
-    """
-    # Cards typically contain a time range plus a button if available.
-    cards = page.locator("div").filter(has_text=re.compile(r"\b\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\b"))
-    out = []
-
-    n = min(cards.count(), 300)
-    for i in range(n):
-        c = cards.nth(i)
-        txt = _safe_text(c)
-        if not txt:
-            continue
-
-        # Skip explicit unavailable
-        if re.search(r"\bThis slot is unavailable\b", txt, re.I):
-            continue
-
-        m = TIME_RANGE_RE.search(txt)
-        if not m:
-            continue
-        start_hm = m.group(1)
-
-        if not _within_filters(day_dt, start_hm):
-            continue
-
-        # Must have a button (book/add etc.)
-        has_button = False
+def _dismiss_cookies(page):
+    for label in ("Accept", "I agree", "Allow all", "Accept all", "OK"):
         try:
-            btns = c.get_by_role("button")
-            if btns.count():
-                if btns.filter(has_text=re.compile(r"(book|add to basket|reserve|add)", re.I)).count():
-                    has_button = True
-                else:
-                    # Some skins use icon-only buttons
-                    has_button = True
+            b = page.get_by_role("button", name=re.compile(label, re.I))
+            if b.count():
+                b.first.click(timeout=1500)
+                break
         except Exception:
             pass
 
-        if not has_button:
-            continue
-
-        out.append((day_dt.strftime("%A"), start_hm, "Padel Tennis"))
-
-    return out
-
-def _collect_slots():
-    today = dt.date.today()
-    all_slots = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(viewport={"width": 1440, "height": 2200})
-        page = ctx.new_page()
-        try:
-            for offset in range(0, DAYS_AHEAD + 1):
-                d = today + dt.timedelta(days=offset)
-                qs = _zstamp_for_date(d)
-                url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={qs}&previousActivityDate={qs}"
-                page.goto(url, timeout=60000, wait_until="domcontentloaded")
-
-                # Try to dismiss any cookie banners that might block clicks
-                for label in ("Accept", "I agree", "Allow all", "Accept all", "OK"):
-                    try:
-                        b = page.get_by_role("button", name=re.compile(label, re.I))
-                        if b.count():
-                            b.first.click(timeout=1500)
-                            break
-                    except Exception:
-                        pass
-
-                slots = _parse_day_slots(page, d)
-                all_slots.extend(slots)
-
-            if not all_slots:
-                _take_debug(page, "no_slots_page")
-
-        finally:
-            ctx.close()
-            browser.close()
-
-    # Deduplicate and sort
-    seen = set()
-    unique = []
-    day_order = { (today + dt.timedelta(days=i)).strftime("%A"): i for i in range(8) }
-    for dname, hm, act in all_slots:
-        key = (dname, hm, act.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((dname, hm, act))
-    unique.sort(key=lambda x: (day_order.get(x[0], 99), int(x[1][:2]), int(x[1][3:5]), x[2]))
-    return unique
-
-# ----------------- Main -----------------
-def main():
+def _robust_wait_gladstone(page):
+    """
+    Wait for Gladstone SPA to finish loading something meaningful.
+    Success = any of:
+     - heading present (e.g., 'Padel Tennis')
+     - a booking button appears
+     - an 'unavailable' badge appears
+     - any time-range text like '06:00 - 07:00' is in DOM
+    """
+    # Wait for network to settle
     try:
-        slots = _collect_slots()
-        if not slots:
-            print("No matching slots.")
-            return 0
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except PWTimeoutError:
+        pass
 
-        lines = [f"{d} {t} — Padel at The Triangle" for (d, t, _) in slots]
-        msg = "🎾 *Padel — slots found:*\n\n" + "\n".join(lines)
-        print(msg)
-        tg_send(msg)
-        return 0
+    _dismiss_cookies(page)
+
+    # Try to wait for a heading (often 'Padel Tennis')
+    try:
+        head = page.get_by_role("heading")
+        head.first.wait_for(timeout=8000)
     except Exception:
-        print("Error: unexpected exception in checker_pw.py")
-        traceback.print_exc(limit=2)
-        return 1
+        pass
 
-if __name__ == "__main__":
-    sys.exit(main())
+    # Poll for content signals up to ~12s
+    deadline = dt.datetime.now() + dt.timedelta(seconds=12)
+    while dt.datetime.now() < deadline:
+        try:
+            # any book-ish button?
+            if page.get_by_role("button", name=re.compile(r"(book|add to basket|reserve|add)", re.I)).count():
+                return True
+        except Exception:
+            pass
+        try:
+            # any 'unavailable' badge?
+            if page.get_by_text(re.compile(r"this slot is unavailable", re.I)).count():
+                return True
+        except Exception:
+            pass
+        # any time range present in the whole page text?
+        try:
+            body_txt = page.locator("body").inner_text(timeout=1000)
+            if TIME_RANGE_RE.search(body_txt):
+                return True
+        except Exception:
+            pass
+
+        # nudge: small scroll to trigger lazy load
+        try:
+            page.evaluate("window.scrollBy(0, 600)")
+        except Exception:
+            pass
+        page.wait_for_timeout(400)
+
+    return False
+
+def _parse_day_slots(page, day_dt: dt.date):
+    cards = page.locator("div").filter(has_text=re.compile(r"\b\d{2}:\d{2}_
