@@ -152,4 +152,122 @@ def _robust_wait_gladstone(page):
     return False
 
 def _parse_day_slots(page, day_dt: dt.date):
-    cards = page.locator("div").filter(has_text=re.compile(r"\b\d{2}:\d{2}_
+    cards = page.locator("div").filter(has_text=re.compile(r"\b\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\b"))
+    out = []
+
+    n = min(cards.count(), 400)
+    for i in range(n):
+        c = cards.nth(i)
+        txt = _safe_text(c)
+        if not txt:
+            continue
+        if re.search(r"\bThis slot is unavailable\b", txt, re.I):
+            continue
+
+        m = TIME_RANGE_RE.search(txt)
+        if not m:
+            continue
+        start_hm = m.group(1)
+        if not _within_filters(day_dt, start_hm):
+            continue
+
+        has_button = False
+        try:
+            btns = c.get_by_role("button")
+            if btns.count():
+                if btns.filter(has_text=re.compile(r"(book|add to basket|reserve|add)", re.I)).count():
+                    has_button = True
+                else:
+                    has_button = True  # icon-only buttons
+        except Exception:
+            pass
+
+        if not has_button:
+            continue
+
+        out.append((day_dt.strftime("%A"), start_hm, "Padel Tennis"))
+
+    return out
+
+def _visit_and_collect_for_date(page, d: dt.date):
+    """
+    Navigate to the Gladstone calendar URL for date d.
+    Return parsed slots; if page didn't load content, retry once.
+    """
+    qs = _zstamp_for_date(d)
+    url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={qs}&previousActivityDate={qs}"
+
+    def _load_once():
+        page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        ok = _robust_wait_gladstone(page)
+        if not ok:
+            return []
+        return _parse_day_slots(page, d)
+
+    slots = _load_once()
+    if not slots:
+        # One controlled retry (hard refresh)
+        try:
+            page.reload(timeout=30000, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        ok = _robust_wait_gladstone(page)
+        if ok:
+            slots = _parse_day_slots(page, d)
+    return slots
+
+def _collect_slots():
+    today = dt.date.today()
+    all_slots = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        ctx = browser.new_context(viewport={"width": 1440, "height": 2200})
+        page = ctx.new_page()
+        try:
+            for offset in range(0, DAYS_AHEAD + 1):
+                d = today + dt.timedelta(days=offset)
+                try:
+                    day_slots = _visit_and_collect_for_date(page, d)
+                    all_slots.extend(day_slots)
+                except Exception as e:
+                    print(f"Day {d.isoformat()} fetch failed: {e}")
+            if not all_slots:
+                _take_debug(page, "no_slots_page")
+        finally:
+            ctx.close()
+            browser.close()
+
+    # Deduplicate and sort
+    seen = set()
+    unique = []
+    day_order = { (today + dt.timedelta(days=i)).strftime("%A"): i for i in range(8) }
+    for dname, hm, act in all_slots:
+        key = (dname, hm, act.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((dname, hm, act))
+    unique.sort(key=lambda x: (day_order.get(x[0], 99), int(x[1][:2]), int(x[1][3:5]), x[2]))
+    return unique
+
+# ----------------- Main -----------------
+def main():
+    try:
+        slots = _collect_slots()
+        if not slots:
+            print("No matching slots.")
+            return 0
+
+        lines = [f"{d} {t} — Padel at The Triangle" for (d, t, _) in slots]
+        msg = "🎾 *Padel — slots found:*\n\n" + "\n".join(lines)
+        print(msg)
+        tg_send(msg)
+        return 0
+    except Exception:
+        print("Error: unexpected exception in checker_pw.py")
+        traceback.print_exc(limit=2)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
