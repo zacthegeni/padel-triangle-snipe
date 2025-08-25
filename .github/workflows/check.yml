@@ -3,7 +3,7 @@ name: Padel Watcher
 on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch: {}       # lets you run it manually from the Actions tab
+  workflow_dispatch: {}       # allow manual runs
 
 jobs:
   watch:
@@ -19,11 +19,11 @@ jobs:
       - name: Check padel timetable
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # --- Optional filters (edit or add as repo-level "Variables" instead) ---
-          EARLIEST_HOUR: "18"   # e.g. 17 = 5pm
-          LATEST_HOUR:   "22"   # exclusive upper bound
-          DAYS_AHEAD:    "2"    # today + next 2 days
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}   # one or many IDs, comma separated
+          # --- Optional filters (set here or as repo "Variables") ---
+          EARLIEST_HOUR: "18"
+          LATEST_HOUR:   "22"
+          DAYS_AHEAD:    "2"
           WEEKENDS_OK:   "true"
           WEEKDAYS_OK:   "true"
         run: python checker.py
