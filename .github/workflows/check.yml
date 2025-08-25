@@ -1,9 +1,11 @@
 name: Padel Watcher
 
 on:
+  # BOTH schedules are declared at the top-level (correct place):
   schedule:
-    - cron: "*/1 * * * *"   # every minute
-  workflow_dispatch: {}
+    - cron: "*/1 * * * *"   # run every minute (main checker)
+    - cron: "0 0 1 * *"     # monthly keepalive so cron never pauses
+  workflow_dispatch: {}      # allow manual runs
 
 jobs:
   watch:
@@ -17,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cache pip + Playwright browsers
+      # Cache pip + Playwright browsers to speed up cold starts
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -46,13 +48,19 @@ jobs:
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+          # scan/behaviour
           MAX_DAYS: "60"
           STOP_AFTER_EMPTY_STREAK: "7"
+
+          # time filters (wide by default)
           EARLIEST_HOUR: "0"
           LATEST_HOUR: "24"
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
-          ACTIVITY_ID: "149A001015"
+
+          # Gladstone calendar config
+          ACTIVITY_ID: "149A001015"  # Padel Tennis @ The Triangle
           START_HOUR_Z: "5"
         run: python checker_pw.py
 
@@ -75,11 +83,8 @@ jobs:
             git push
           fi
 
-  # keepalive to prevent cron pausing
   keepalive:
     runs-on: ubuntu-latest
-    schedule:
-      - cron: "0 0 1 * *"
     steps:
       - uses: actions/checkout@v4
       - run: |
