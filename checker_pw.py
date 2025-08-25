@@ -4,7 +4,7 @@ from playwright.sync_api import sync_playwright
 import requests
 
 CENTRE_PAGE = "https://www.placesleisure.org/centres/the-triangle/centre-activities/sports/"
-LH_BOOKINGS = "https://pfpleisure-pochub.org/LhWeb/en/Public/Bookings"  # fallback path (their Leisure Hub)
+LH_BOOKINGS = "https://pfpleisure-pochub.org/LhWeb/en/Public/Bookings"
 ACTIVITY_NAME = os.getenv("ACTIVITY_NAME", "Padel")
 
 EARLIEST_HOUR = int(os.getenv("EARLIEST_HOUR", "18"))
@@ -36,12 +36,10 @@ def slot_ok(day_str: str, time_str: str) -> bool:
     day_str = (day_str or "").strip()
     if day_str and day_str not in valid_days:
         return False
-    # weekday/weekend filter
     check_day = day_str or today.strftime("%A")
     is_weekend = check_day in ("Saturday", "Sunday")
     if is_weekend and not WEEKENDS_OK: return False
     if (not is_weekend) and not WEEKDAYS_OK: return False
-    # time filter
     try:
         hh = int(time_str.split(":")[0])
     except Exception:
@@ -49,10 +47,8 @@ def slot_ok(day_str: str, time_str: str) -> bool:
     return EARLIEST_HOUR <= hh < LATEST_HOUR
 
 def extract_from_cards(texts):
-    """texts: list of surrounding text blocks near 'Book' buttons"""
     slots = []
     for t in texts:
-        # try to pull weekday + hh:mm
         m_time = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", t)
         m_day  = re.search(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", t, re.I)
         if m_time:
@@ -60,7 +56,6 @@ def extract_from_cards(texts):
             tm  = m_time.group(0)
             if slot_ok(day, tm):
                 slots.append((day, tm))
-    # de-dupe
     return sorted(set(slots))
 
 def scrape_with_playwright():
@@ -70,58 +65,47 @@ def scrape_with_playwright():
         ctx = browser.new_context()
         page = ctx.new_page()
 
-        # --- Try centre sports page first (it’s already scoped to The Triangle) ---
+        # Try the Triangle sports page
         try:
             page.goto(CENTRE_PAGE, timeout=60000)
-            # Dismiss cookie banners if present
             for label in ("Accept", "I agree", "Allow all"):
                 loc = page.get_by_role("button", name=re.compile(label, re.I))
                 if loc.count():
                     loc.first.click(timeout=2000)
                     break
-            # jump to timetable anchor if present
             try:
                 page.locator('a[href="#timetable"]').first.click(timeout=2000)
             except Exception:
                 pass
 
-            # Try native <select> first
-            # Select option that contains "Padel"
-            selects = page.locator("select")
+            # Try to select "Padel"
             selected = False
+            selects = page.locator("select")
             for i in range(selects.count()):
                 sel = selects.nth(i)
                 opts = sel.locator("option")
-                all_opts = [opts.nth(j).inner_text().strip() for j in range(opts.count())]
-                if any(re.search(r"\bpadel\b", o, re.I) for o in all_opts):
+                if any(re.search(r"\bpadel\b", opts.nth(j).inner_text(), re.I) for j in range(opts.count())):
                     sel.select_option(label=re.compile(r"padel", re.I))
                     selected = True
                     break
-
-            # If it's a custom dropdown, click it and pick "Padel"
             if not selected:
-                # Look for any combobox / button that opens an activity list
                 candidates = page.locator('[role="combobox"], .select, button, [data-role="dropdown"]')
                 if candidates.count():
                     try:
                         candidates.first.click()
-                        dd = page.locator("text=Padel").first
-                        dd.click(timeout=4000)
+                        page.locator("text=Padel").first.click(timeout=4000)
                         selected = True
                     except Exception:
                         pass
 
-            # wait for results to render (cards with Book buttons)
             page.wait_for_timeout(4000)
             book_btns = page.get_by_role("link", name=re.compile(r"\bbook\b", re.I))
             if book_btns.count() == 0:
-                # sometimes 'Book' may be a button, not link
                 book_btns = page.get_by_role("button", name=re.compile(r"\bbook\b", re.I))
 
             texts = []
             for i in range(min(book_btns.count(), 50)):
                 btn = book_btns.nth(i)
-                # get some surrounding text
                 parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
                 try:
                     t = parent.inner_text(timeout=1000)
@@ -133,19 +117,15 @@ def scrape_with_playwright():
         except Exception as e:
             print(f"Sports page scrape failed: {e}")
 
-        # --- Fallback: LhWeb 'Available bookings' page (site-wide), then filter ---
+        # Fallback: Leisure Hub search
         if not found:
             try:
                 page.goto(LH_BOOKINGS, timeout=60000)
-                # Accept cookies if any
                 for label in ("Accept", "I agree", "Allow all"):
                     loc = page.get_by_role("button", name=re.compile(label, re.I))
                     if loc.count():
                         loc.first.click(timeout=2000)
                         break
-
-                # Try to open site selector and choose 'The Triangle'
-                # (different instances label it 'Select Site' or just 'Site')
                 site_boxes = page.get_by_role("combobox")
                 for i in range(site_boxes.count()):
                     try:
@@ -153,8 +133,6 @@ def scrape_with_playwright():
                         break
                     except Exception:
                         pass
-
-                # If a typed search exists, try typing 'Padel'
                 try:
                     inp = page.get_by_role("textbox").first
                     inp.fill("Padel")
@@ -169,35 +147,3 @@ def scrape_with_playwright():
 
                 texts = []
                 for i in range(min(book_btns.count(), 50)):
-                    btn = book_btns.nth(i)
-                    parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
-                    try:
-                        t = parent.inner_text(timeout=1000)
-                    except Exception:
-                        t = btn.inner_text()
-                    # Only keep cards that mention Padel
-                    if re.search(r"\bpadel\b", t, re.I):
-                        texts.append(t)
-
-                found = extract_from_cards(texts)
-            except Exception as e:
-                print(f"LhWeb scrape failed: {e}")
-
-        ctx.close()
-        browser.close()
-    return found
-
-def main():
-    slots = scrape_with_playwright()
-    if not slots:
-        print("No matching slots.")
-        return 0
-
-    lines = [f"{d or '(day tbc)'} {t} — Padel at The Triangle" for (d, t) in slots]
-    msg = "🎾 Padel — slots found:\n\n" + "\n".join(lines) + "\n\nBook via the Triangle page → Sports → Padel."
-    print(msg)
-    tg_send(msg)
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
