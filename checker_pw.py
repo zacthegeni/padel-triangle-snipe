@@ -1,7 +1,7 @@
 import os, re, sys, json, traceback
 import datetime as dt
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Dict
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import requests
@@ -16,11 +16,11 @@ LATEST_HOUR   = int(os.getenv("LATEST_HOUR",   "24"))
 WEEKENDS_OK   = os.getenv("WEEKENDS_OK", "true").lower() == "true"
 WEEKDAYS_OK   = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 
-MAX_DAYS                = int(os.getenv("MAX_DAYS", "60"))
-STOP_AFTER_EMPTY_STREAK = int(os.getenv("STOP_AFTER_EMPTY_STREAK", "7"))
+SCAN_DAYS     = int(os.getenv("SCAN_DAYS", "14"))  # always check today + N days
 
 TG_TOKEN   = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
 
 STATE_DIR   = Path("state")
 STATE_DIR.mkdir(exist_ok=True)
@@ -52,11 +52,11 @@ def tg_send(msg: str, chat_ids: str | None = None):
         except Exception as e:
             print(f"Telegram send failed for {cid}: {e}")
 
-def tg_get_updates(offset: int | None) -> Dict:
+def tg_get_updates(offset: int | None, fallback: bool = False) -> Dict:
     if not TG_TOKEN:
         return {"ok": False, "result": []}
-    params = {}
-    if offset is not None:
+    params = {"limit": 100, "allowed_updates": ["message"]}
+    if not fallback and offset is not None:
         params["offset"] = offset
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params=params, timeout=20)
@@ -139,7 +139,10 @@ def _parse_day(page, d: dt.date):
     cards = page.locator("div").filter(has_text=re.compile(r"\d{2}:\d{2}\s*-\s*\d{2}:\d{2}"))
     for i in range(min(cards.count(), 400)):
         c = cards.nth(i)
-        txt = (c.inner_text(timeout=500) or "").strip()
+        try:
+            txt = (c.inner_text(timeout=500) or "").strip()
+        except Exception:
+            continue
         if not txt or "unavailable" in txt.lower():
             continue
         m = TIME_RANGE_RE.search(txt)
@@ -162,58 +165,71 @@ def collect_slots():
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context()
         page = ctx.new_page()
-        empty = 0
-        for offset in range(MAX_DAYS):
+        for offset in range(SCAN_DAYS + 1):  # today + N days
             d = today + dt.timedelta(days=offset)
             qs = _zstamp_for_date(d)
             url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={qs}&previousActivityDate={qs}"
             page.goto(url, timeout=60000)
             if not _robust_wait(page):
-                empty += 1
-                if empty >= STOP_AFTER_EMPTY_STREAK:
-                    break
                 continue
-            day_slots = _parse_day(page, d)
-            if day_slots:
-                all_slots.extend(day_slots)
-                empty = 0
-            else:
-                empty += 1
-                if empty >= STOP_AFTER_EMPTY_STREAK:
-                    break
+            all_slots.extend(_parse_day(page, d))
         ctx.close()
         browser.close()
-    # dedupe
     seen, uniq = set(), []
     for s in all_slots:
         k = (s[0], s[2])
         if k not in seen:
             uniq.append(s)
             seen.add(k)
+    uniq.sort(key=lambda x: (x[0], x[2]))
     return uniq
 
 # ----------------- Telegram commands -----------------
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+def _normalise_command(text: str) -> tuple[str, str]:
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+    if t.startswith("@"):
+        parts = t.split(maxsplit=1)
+        t = parts[1] if len(parts) > 1 else ""
+    if not t.startswith("/"):
+        return "", ""
+    first, *rest = t.split(maxsplit=1)
+    if "@" in first:
+        cmd, suffix = first.split("@", 1)
+        if BOT_USERNAME and suffix.lower() != BOT_USERNAME:
+            return "", ""
+        first = cmd
+    return first.lower(), (rest[0] if rest else "")
+
 def handle_commands():
     targets = load_targets()
     last_id = load_last_update_id()
     res = tg_get_updates(last_id + 1 if last_id else None)
+    updates = res.get("result", []) if res.get("ok") else []
+    if not updates:
+        res2 = tg_get_updates(None, fallback=True)
+        if res2.get("ok"):
+            updates = res2.get("result", [])
     notify_ids = set()
-    if not res.get("ok"):
+    if not updates:
         return targets, notify_ids
     max_id = last_id or 0
-    for upd in res.get("result", []):
+    for upd in updates:
         max_id = max(max_id, upd.get("update_id", 0))
         msg = upd.get("message") or {}
         text = (msg.get("text") or "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
-        if not text:
+        if not text or not chat_id:
+            continue
+        cmd, tail = _normalise_command(text)
+        if not cmd:
             continue
         notify_ids.add(chat_id)
-        cmd = text.split()[0].lower()
         if cmd in ("/want", "/add"):
-            dates = set(DATE_RE.findall(text))
+            dates = set(DATE_RE.findall(tail))
             if dates:
                 targets |= dates
                 tg_send("✅ Added:\n" + "\n".join(sorted(dates)), chat_id)
@@ -223,10 +239,7 @@ def handle_commands():
             targets.clear()
             tg_send("🧹 Cleared targets.", chat_id)
         elif cmd == "/list":
-            if targets:
-                tg_send("🎯 Watching:\n" + "\n".join(sorted(targets)), chat_id)
-            else:
-                tg_send("No targets set. Use /want YYYY-MM-DD.", chat_id)
+            tg_send("🎯 Watching:\n" + ("\n".join(sorted(targets)) if targets else "No targets set."), chat_id)
         elif cmd in ("/help", "/start"):
             tg_send("Commands:\n/want YYYY-MM-DD …\n/add YYYY-MM-DD …\n/list\n/clear", chat_id)
     save_last_update_id(max_id)
@@ -235,22 +248,25 @@ def handle_commands():
 
 # ----------------- Main -----------------
 def main():
-    targets, notify_ids = handle_commands()
-    slots = collect_slots()
-    if targets:
-        slots = [s for s in slots if s[0] in targets]
-    if not slots:
-        print("No matching slots.")
+    try:
+        targets, notify_ids = handle_commands()
+        slots = collect_slots()
+        if targets:
+            slots = [s for s in slots if s[0] in targets]
+        if not slots:
+            print("No matching slots.")
+            return 0
+        lines = [f"{iso} ({day}) {time} — {act}\n🔗 {url}" for (iso, day, time, act, url) in slots]
+        msg = "🎾 *Padel slots found:*\n\n" + "\n\n".join(lines)
+        print(msg)
+        tg_send(msg)
+        for cid in notify_ids:
+            tg_send(msg, cid)
         return 0
-    lines = []
-    for iso, day, time, act, url in slots:
-        lines.append(f"{iso} ({day}) {time} — {act}\n🔗 {url}")
-    msg = "🎾 *Padel slots found:*\n\n" + "\n\n".join(lines)
-    print(msg)
-    tg_send(msg)
-    for cid in notify_ids:
-        tg_send(msg, cid)
-    return 0
+    except Exception:
+        print("Error: unexpected exception in checker_pw.py")
+        traceback.print_exc(limit=2)
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())
