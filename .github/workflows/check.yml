@@ -2,7 +2,7 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -22,11 +22,15 @@ jobs:
           pip install playwright requests
           python -m playwright install --with-deps chromium
 
+      - name: (debug) show files
+        run: |
+          pwd
+          ls -la
+
       - name: Check padel timetable (Playwright)
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}   # can be multiple, comma/semicolon separated
-          # --- Filters ---
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           EARLIEST_HOUR: "18"
           LATEST_HOUR:   "22"
           DAYS_AHEAD:    "2"
