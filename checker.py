@@ -1,104 +1,122 @@
-import os, sys, re, time, datetime as dt
+import os, re, sys, datetime as dt
 import requests
 from bs4 import BeautifulSoup
 
-# ====== CONFIG ======
-CENTRE_URL = "https://www.placesleisure.org/centres/the-triangle/centre-activities/sports/"
-KEYWORD = "Padel"  # what we search for on the timetable/results
-# Filter examples: set to None to disable
-EARLIEST_HOUR = int(os.getenv("EARLIEST_HOUR", "18"))  # 24h clock
-LATEST_HOUR   = int(os.getenv("LATEST_HOUR", "22"))
-DAYS_AHEAD    = int(os.getenv("DAYS_AHEAD", "2"))      # today + next N days
-# Telegram
-TG_TOKEN   = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+# ====== CONFIG (set via GitHub "Secrets" and "Variables") ======
+CENTRE_URL   = "https://www.placesleisure.org/centres/the-triangle/centre-activities/sports/"
+KEYWORD      = os.getenv("KEYWORD", "Padel")
+EARLIEST_HH  = int(os.getenv("EARLIEST_HOUR", "18"))  # 24h clock (inclusive)
+LATEST_HH    = int(os.getenv("LATEST_HOUR",   "22"))  # 24h clock (exclusive)
+DAYS_AHEAD   = int(os.getenv("DAYS_AHEAD",    "2"))   # today + next N days
+WEEKENDS_OK  = os.getenv("WEEKENDS_OK", "true").lower() == "true"
+WEEKDAYS_OK  = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 
-def tg_send(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram not configured")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "disable_web_page_preview": True})
+TG_TOKEN     = os.getenv("TG_TOKEN")
+TG_CHAT_IDS  = os.getenv("TG_CHAT_ID", "")  # one or many IDs, comma/semicolon separated
 
-def normalise_spaces(s): return re.sub(r"\s+", " ", s or "").strip()
+def normalise(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
-def fetch_timetable_html():
-    # Load the sports page; the “Book via timetable” link lives here.
-    r = requests.get(CENTRE_URL, timeout=30)
+def fetch(url: str) -> str:
+    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
 
-def extract_timetable_link(html):
+def extract_padel_timetable_link(html: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
-    # Find the Padel section then its "Book via timetable" link
-    padel_header = None
-    for h in soup.find_all(["h2","h3","h4"]):
-        if normalise_spaces(h.get_text()).lower() == "padel":
-            padel_header = h
-            break
-    if not padel_header:
+    headings = soup.find_all(["h2", "h3", "h4"])
+    target = next((h for h in headings if normalise(h.get_text()).lower() == "padel"), None)
+    if not target:
         return None
-    link = None
-    for a in padel_header.find_all_next("a", href=True, limit=10):
-        if "timetable" in a.get_text(strip=True).lower() or "book" in a.get_text(strip=True).lower():
-            link = a["href"]
-            break
-    return link
+    for a in target.find_all_next("a", href=True, limit=20):
+        txt = normalise(a.get_text()).lower()
+        if "timetable" in txt or "book" in txt:
+            href = a["href"]
+            if href.startswith("/"):
+                href = "https://www.placesleisure.org" + href
+            return href
+    return None
 
-def list_slots(timetable_html):
+def parse_slots(timetable_html: str):
     soup = BeautifulSoup(timetable_html, "html.parser")
-    # The timetable renders sessions with text blocks and “Book” buttons.
-    # Grab any visible “Book” buttons and read the surrounding time/day.
-    slots = []
-    for btn in soup.find_all("a", string=re.compile(r"book", re.I)):
-        # Walk up to a card/row element to pull context (date/time/activity)
-        parent_text = normalise_spaces(btn.find_parent().get_text(" "))
-        # Try to find a HH:MM pattern and the day label
-        m_time = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", parent_text)
-        m_day  = re.search(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", parent_text, re.I)
-        # Also sanity-check activity contains “Padel”
-        is_padel = re.search(r"padel", parent_text, re.I) is not None
-        if m_time and is_padel:
-            slots.append({
+    out = []
+    for a in soup.find_all("a", href=True):
+        if re.search(r"\bbook\b", a.get_text(strip=True), re.I):
+            block = a.find_parent()
+            text = normalise(block.get_text(" ")) if block else normalise(a.get_text(" "))
+            if not re.search(KEYWORD, text, re.I):
+                continue
+            m_time = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", text)
+            m_day  = re.search(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", text, re.I)
+            if not m_time:
+                continue
+            href = a["href"]
+            if href.startswith("/"):
+                href = "https://www.placesleisure.org" + href
+            out.append({
                 "time": m_time.group(0),
-                "day":  m_day.group(0) if m_day else "",
-                "text": parent_text[:300],
-                "href": btn.get("href")
+                "day":  (m_day.group(0).capitalize() if m_day else ""),
+                "href": href,
+                "raw":  text[:300]
             })
-    return slots
+    return out
 
-def slot_ok(slot):
-    # Day filter: within today..(today + DAYS_AHEAD)
+def slot_allowed(slot) -> bool:
     today = dt.date.today()
-    valid_days = [ (today + dt.timedelta(days=i)).strftime("%A") for i in range(DAYS_AHEAD+1) ]
+    valid_days = [(today + dt.timedelta(days=i)).strftime("%A") for i in range(DAYS_AHEAD + 1)]
     if slot["day"] and slot["day"] not in valid_days:
         return False
-    # Time filter
+    day = slot["day"] or today.strftime("%A")
+    is_weekend = day in ("Saturday", "Sunday")
+    if is_weekend and not WEEKENDS_OK: return False
+    if (not is_weekend) and not WEEKDAYS_OK: return False
     hh = int(slot["time"].split(":")[0])
-    return EARLIEST_HOUR <= hh < LATEST_HOUR
+    return EARLIEST_HH <= hh < LATEST_HH
+
+def tg_send(text: str):
+    # Accept one or many chat IDs (comma or semicolon separated)
+    raw = TG_CHAT_IDS or ""
+    ids = []
+    for chunk in raw.replace(";", ",").split(","):
+        cid = chunk.strip()
+        if cid:
+            ids.append(cid)
+    if not TG_TOKEN or not ids:
+        print("Telegram not configured (missing TG_TOKEN or TG_CHAT_ID).")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for cid in ids:
+        try:
+            requests.post(url, json={
+                "chat_id": cid,
+                "text": text,
+                "disable_web_page_preview": True
+            }, timeout=20)
+        except Exception as e:
+            print(f"Telegram send failed for {cid}: {e}")
 
 def main():
-    base_html = fetch_timetable_html()
-    link = extract_timetable_link(base_html)
+    try:
+        base = fetch(CENTRE_URL)
+    except Exception as e:
+        print(f"Fetch centre page failed: {e}")
+        return 0
+    link = extract_padel_timetable_link(base)
     if not link:
-        print("Couldn’t find the Padel timetable link; site layout may have changed.")
+        print("Couldn’t locate the Padel timetable link (layout may have changed).")
         return 0
-    # Follow the timetable link
-    if link.startswith("/"):
-        link = "https://www.placesleisure.org" + link
-    r = requests.get(link, timeout=30)
-    r.raise_for_status()
-    slots = [s for s in list_slots(r.text) if slot_ok(s)]
+    try:
+        thtml = fetch(link)
+    except Exception as e:
+        print(f"Fetch timetable failed: {e}")
+        return 0
+    slots = [s for s in parse_slots(thtml) if slot_allowed(s)]
     if not slots:
-        print("No matching slots found.")
+        print("No matching slots.")
         return 0
-    # De-dupe & notify
     lines = []
     for s in slots:
-        url = s["href"]
-        if url and url.startswith("/"):
-            url = "https://www.placesleisure.org" + url
-        lines.append(f"{s['day']} {s['time']} — Padel\n{url or '(open timetable and select Padel)'}")
+        lines.append(f"{s['day'] or '(day tbc)'} {s['time']} — Padel\n{s['href']}")
     msg = "🎾 Padel at The Triangle — slots found:\n\n" + "\n\n".join(lines)
     print(msg)
     tg_send(msg)
