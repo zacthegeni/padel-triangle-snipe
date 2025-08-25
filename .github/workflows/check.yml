@@ -77,11 +77,14 @@ jobs:
           fi
 
   keepalive:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && github.event.schedule == '0 0 1 * *'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      - name: Touch keepalive file and push
+        run: |
           date +%F > .keepalive
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
