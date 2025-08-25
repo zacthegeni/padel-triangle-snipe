@@ -1,7 +1,7 @@
 import os, re, sys, json, traceback
 import datetime as dt
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple, Set
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import requests
@@ -18,17 +18,18 @@ WEEKDAYS_OK   = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 
 SCAN_DAYS     = int(os.getenv("SCAN_DAYS", "14"))  # today + N days
 
-TG_TOKEN   = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
+TG_TOKEN      = os.getenv("TG_TOKEN")
+TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "")
+BOT_USERNAME  = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
 
-STATE_DIR   = Path("state")
-STATE_DIR.mkdir(exist_ok=True)
+# Anti-dup behaviour: on first ever run, fast-forward to the latest update id silently
+FAST_FORWARD_UPDATES = os.getenv("FAST_FORWARD_UPDATES", "true").lower() == "true"
+
+STATE_DIR   = Path("state"); STATE_DIR.mkdir(exist_ok=True)
 TARGETS_FP  = STATE_DIR / "targets.json"
 TGSTATE_FP  = STATE_DIR / "tg_last_update.json"
 
-DEBUG_DIR = Path("debug")
-DEBUG_DIR.mkdir(exist_ok=True)
+DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 
 # ----------------- Telegram -----------------
 def tg_send(msg: str, chat_ids: str | None = None):
@@ -41,28 +42,34 @@ def tg_send(msg: str, chat_ids: str | None = None):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={
-                    "chat_id": cid,
-                    "text": msg,
-                    "disable_web_page_preview": False,
-                    "parse_mode": "Markdown",
-                },
+                json={"chat_id": cid, "text": msg, "disable_web_page_preview": False, "parse_mode": "Markdown"},
                 timeout=20,
             )
         except Exception as e:
             print(f"Telegram send failed for {cid}: {e}")
 
-def tg_get_updates(offset: int | None, fallback: bool = False) -> Dict:
+def tg_get_updates(offset: int | None) -> Dict:
     if not TG_TOKEN:
         return {"ok": False, "result": []}
     params = {"limit": 100, "allowed_updates": ["message"]}
-    if not fallback and offset is not None:
+    if offset is not None:
         params["offset"] = offset
     try:
         r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params=params, timeout=20)
         return r.json()
     except Exception:
         return {"ok": False, "result": []}
+
+def tg_ack_until(offset_after: int):
+    """Tell Telegram we've consumed up to update_id == offset_after-1, even if our state file didn't persist."""
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+            params={"offset": offset_after, "limit": 1, "allowed_updates": ["message"]},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
 # ----------------- State -----------------
 def _read_json(path: Path, default):
@@ -80,11 +87,11 @@ def _write_json(path: Path, data):
     except Exception:
         return False
 
-def load_targets() -> set[str]:
+def load_targets() -> Set[str]:
     data = _read_json(TARGETS_FP, {"dates": []})
     return set(data.get("dates", []))
 
-def save_targets(dates: set[str]):
+def save_targets(dates: Set[str]):
     _write_json(TARGETS_FP, {"dates": sorted(dates)})
 
 def load_last_update_id() -> int | None:
@@ -105,13 +112,10 @@ def _within_filters(day_dt: dt.date, start_hhmm: str) -> bool:
         hh = int(start_hhmm.split(":")[0])
     except Exception:
         return False
-    if not (EARLIEST_HOUR <= hh < LATEST_HOUR):
-        return False
+    if not (EARLIEST_HOUR <= hh < LATEST_HOUR): return False
     is_weekend = day_dt.weekday() >= 5
-    if is_weekend and not WEEKENDS_OK:
-        return False
-    if (not is_weekend) and not WEEKDAYS_OK:
-        return False
+    if is_weekend and not WEEKENDS_OK: return False
+    if (not is_weekend) and not WEEKDAYS_OK: return False
     return True
 
 def _robust_wait(page):
@@ -121,14 +125,11 @@ def _robust_wait(page):
         pass
     deadline = dt.datetime.now() + dt.timedelta(seconds=12)
     while dt.datetime.now() < deadline:
-        if page.get_by_role("button", name=re.compile(r"(book|add to basket)", re.I)).count():
-            return True
-        if page.get_by_text(re.compile(r"this slot is unavailable", re.I)).count():
-            return True
+        if page.get_by_role("button", name=re.compile(r"(book|add to basket)", re.I)).count(): return True
+        if page.get_by_text(re.compile(r"this slot is unavailable", re.I)).count(): return True
         try:
             txt = page.locator("body").inner_text(timeout=1000)
-            if TIME_RANGE_RE.search(txt):
-                return True
+            if TIME_RANGE_RE.search(txt): return True
         except Exception:
             pass
         page.wait_for_timeout(400)
@@ -187,15 +188,13 @@ def collect_slots():
 # ----------------- Telegram commands -----------------
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
-def _normalise_command(text: str) -> tuple[str, str]:
+def _normalise_command(text: str) -> Tuple[str, str]:
     t = (text or "").strip()
-    if not t:
-        return "", ""
+    if not t: return "", ""
     if t.startswith("@"):
         parts = t.split(maxsplit=1)
         t = parts[1] if len(parts) > 1 else ""
-    if not t.startswith("/"):
-        return "", ""
+    if not t.startswith("/"): return "", ""
     first, *rest = t.split(maxsplit=1)
     if "@" in first:
         cmd, suffix = first.split("@", 1)
@@ -204,49 +203,61 @@ def _normalise_command(text: str) -> tuple[str, str]:
         first = cmd
     return first.lower(), (rest[0] if rest else "")
 
-def handle_commands():
+def handle_commands() -> Tuple[Set[str], Set[str]]:
     targets = load_targets()
     last_id = load_last_update_id()
-    res = tg_get_updates(last_id + 1 if last_id else None)
+
+    # First-run fast-forward: skip historic backlog
+    if last_id is None and FAST_FORWARD_UPDATES:
+        res0 = tg_get_updates(None)
+        if res0.get("ok") and res0.get("result"):
+            max_seen = max(u.get("update_id", 0) for u in res0["result"])
+            save_last_update_id(max_seen)
+            # Also ack to Telegram so the queue is advanced even if state commit fails
+            tg_ack_until(max_seen + 1)
+        return targets, set()
+
+    res = tg_get_updates((last_id or 0) + 1)
     updates = res.get("result", []) if res.get("ok") else []
+    notify_ids: Set[str] = set()
     if not updates:
-        res2 = tg_get_updates(None, fallback=True)
-        if res2.get("ok"):
-            updates = res2.get("result", [])
-    notify_ids = set()
-    if updates:
-        max_id = last_id or 0
-        for upd in updates:
-            max_id = max(max_id, upd.get("update_id", 0))
-            msg = upd.get("message") or {}
-            text = (msg.get("text") or "").strip()
-            chat_id = str(msg.get("chat", {}).get("id", ""))
-            if not text or not chat_id:
-                continue
-            cmd, tail = _normalise_command(text)
-            if not cmd:
-                continue
-            notify_ids.add(chat_id)
-            if cmd in ("/want", "/add"):
-                dates = set(DATE_RE.findall(tail))
-                if dates:
-                    targets |= dates
-                    tg_send("✅ Added:\n" + "\n".join(sorted(dates)), chat_id)
-                else:
-                    tg_send("Usage: /want YYYY-MM-DD [YYYY-MM-DD ...]", chat_id)
-            elif cmd == "/clear":
-                targets.clear()
-                tg_send("🧹 Cleared targets.", chat_id)
-            elif cmd == "/list":
-                tg_send("🎯 Watching:\n" + ("\n".join(sorted(targets)) if targets else "No targets set."), chat_id)
-            elif cmd in ("/help", "/start"):
-                tg_send("Commands:\n/want YYYY-MM-DD …\n/add YYYY-MM-DD …\n/list\n/clear", chat_id)
-        save_last_update_id(max_id)
+        return targets, notify_ids
+
+    max_id = last_id or 0
+    for upd in updates:
+        max_id = max(max_id, upd.get("update_id", 0))
+        msg = upd.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if not text or not chat_id:
+            continue
+        cmd, tail = _normalise_command(text)
+        if not cmd:
+            continue
+        notify_ids.add(chat_id)
+        if cmd in ("/want", "/add"):
+            dates = set(DATE_RE.findall(tail))
+            if dates:
+                targets |= dates
+                tg_send("✅ Added:\n" + "\n".join(sorted(dates)), chat_id)
+            else:
+                tg_send("Usage: /want YYYY-MM-DD [YYYY-MM-DD ...]", chat_id)
+        elif cmd == "/clear":
+            targets.clear()
+            tg_send("🧹 Cleared targets.", chat_id)
+        elif cmd == "/list":
+            tg_send("🎯 Watching:\n" + ("\n".join(sorted(targets)) if targets else "No targets set."), chat_id)
+        elif cmd in ("/help", "/start"):
+            tg_send("Commands:\n/want YYYY-MM-DD …\n/add YYYY-MM-DD …\n/list\n/clear", chat_id)
+
+    # Persist state AND forcibly ack to Telegram so duplicates cannot recur
+    save_last_update_id(max_id)
+    tg_ack_until(max_id + 1)
     save_targets(targets)
     return targets, notify_ids
 
 # ----------------- Auto-prune past target dates -----------------
-def prune_expired_targets(targets: set[str]):
+def prune_expired_targets(targets: Set[str]) -> Tuple[Set[str], Set[str]]:
     today_iso = dt.date.today().isoformat()
     removed = {d for d in targets if d < today_iso}
     if removed:
