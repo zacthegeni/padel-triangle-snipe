@@ -1,4 +1,3 @@
-# checker_pw.py
 import os, re, sys, time, datetime as dt
 from playwright.sync_api import sync_playwright
 import requests
@@ -58,6 +57,27 @@ def extract_from_cards(texts):
                 slots.append((day, tm))
     return sorted(set(slots))
 
+
+def collect_texts(book_btns, require_padel=False, limit=50):
+    """Extract relevant card text for each booking button.
+
+    Args:
+        book_btns: A Playwright Locator of the booking buttons.
+        require_padel: If True, discard cards that don't mention Padel.
+        limit: Max number of booking buttons to inspect.
+    """
+    texts = []
+    for i in range(min(book_btns.count(), limit)):
+        btn = book_btns.nth(i)
+        parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
+        try:
+            t = parent.inner_text(timeout=1000)
+        except Exception:
+            t = btn.inner_text()
+        if not require_padel or re.search(r"\bpadel\b", t, re.I):
+            texts.append(t)
+    return texts
+
 def scrape_with_playwright():
     found = []
     with sync_playwright() as p:
@@ -65,35 +85,39 @@ def scrape_with_playwright():
         ctx = browser.new_context()
         page = ctx.new_page()
 
-        # Try the Triangle sports page
+        # Attempt 1: Triangle sports page
         try:
             page.goto(CENTRE_PAGE, timeout=60000)
             for label in ("Accept", "I agree", "Allow all"):
-                loc = page.get_by_role("button", name=re.compile(label, re.I))
-                if loc.count():
-                    loc.first.click(timeout=2000)
+                btn = page.get_by_role("button", name=re.compile(label, re.I))
+                if btn.count():
+                    btn.first.click(timeout=2000)
                     break
             try:
                 page.locator('a[href="#timetable"]').first.click(timeout=2000)
             except Exception:
                 pass
 
-            # Try to select "Padel"
+            # Try native select
             selected = False
             selects = page.locator("select")
             for i in range(selects.count()):
                 sel = selects.nth(i)
                 opts = sel.locator("option")
-                if any(re.search(r"\bpadel\b", opts.nth(j).inner_text(), re.I) for j in range(opts.count())):
+                labels = [opts.nth(j).inner_text().strip() for j in range(opts.count())]
+                if any(re.search(r"\bpadel\b", x, re.I) for x in labels):
                     sel.select_option(label=re.compile(r"padel", re.I))
                     selected = True
                     break
+            # Fallback custom dropdown
             if not selected:
-                candidates = page.locator('[role="combobox"], .select, button, [data-role="dropdown"]')
-                if candidates.count():
+                try:
+                    page.get_by_text(re.compile(r"\bpadel\b", re.I)).first.click(timeout=4000)
+                    selected = True
+                except Exception:
                     try:
-                        candidates.first.click()
-                        page.locator("text=Padel").first.click(timeout=4000)
+                        page.get_by_role("combobox").first.click(timeout=2000)
+                        page.get_by_text(re.compile(r"\bpadel\b", re.I)).first.click(timeout=4000)
                         selected = True
                     except Exception:
                         pass
@@ -103,39 +127,34 @@ def scrape_with_playwright():
             if book_btns.count() == 0:
                 book_btns = page.get_by_role("button", name=re.compile(r"\bbook\b", re.I))
 
-            texts = []
-            for i in range(min(book_btns.count(), 50)):
-                btn = book_btns.nth(i)
-                parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
-                try:
-                    t = parent.inner_text(timeout=1000)
-                except Exception:
-                    t = btn.inner_text()
-                texts.append(t)
-
+            texts = collect_texts(book_btns)
             found = extract_from_cards(texts)
         except Exception as e:
             print(f"Sports page scrape failed: {e}")
 
-        # Fallback: Leisure Hub search
+        # Attempt 2: Leisure Hub fallback
         if not found:
             try:
                 page.goto(LH_BOOKINGS, timeout=60000)
                 for label in ("Accept", "I agree", "Allow all"):
-                    loc = page.get_by_role("button", name=re.compile(label, re.I))
-                    if loc.count():
-                        loc.first.click(timeout=2000)
+                    btn = page.get_by_role("button", name=re.compile(label, re.I))
+                    if btn.count():
+                        btn.first.click(timeout=2000)
                         break
-                site_boxes = page.get_by_role("combobox")
-                for i in range(site_boxes.count()):
+
+                # Try choosing 'The Triangle' site
+                combos = page.get_by_role("combobox")
+                for i in range(combos.count()):
                     try:
-                        site_boxes.nth(i).select_option(label=re.compile(r"\btriangle\b", re.I))
+                        combos.nth(i).select_option(label=re.compile(r"\btriangle\b", re.I))
                         break
                     except Exception:
                         pass
+
+                # Search for Padel
                 try:
-                    inp = page.get_by_role("textbox").first
-                    inp.fill("Padel")
+                    tb = page.get_by_role("textbox").first
+                    tb.fill("Padel")
                     page.keyboard.press("Enter")
                 except Exception:
                     pass
@@ -145,5 +164,25 @@ def scrape_with_playwright():
                 if book_btns.count() == 0:
                     book_btns = page.get_by_role("button", name=re.compile(r"\bbook\b", re.I))
 
-                texts = []
-                for i in range(min(book_btns.count(), 50)):
+                texts = collect_texts(book_btns, require_padel=True)
+                found = extract_from_cards(texts)
+            except Exception as e:
+                print(f"LhWeb scrape failed: {e}")
+
+        ctx.close()
+        browser.close()
+    return found
+
+def main():
+    slots = scrape_with_playwright()
+    if not slots:
+        print("No matching slots.")
+        return 0
+    lines = [f"{d or '(day tbc)'} {t} — Padel at The Triangle" for (d, t) in slots]
+    msg = "🎾 Padel — slots found:\n\n" + "\n".join(lines)
+    print(msg)
+    tg_send(msg)
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
