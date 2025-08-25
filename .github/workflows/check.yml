@@ -3,7 +3,7 @@ name: Padel Watcher
 on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 minutes
-  workflow_dispatch: {}       # allow manual runs
+  workflow_dispatch: {}
 
 jobs:
   watch:
@@ -12,18 +12,25 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests beautifulsoup4
-      - name: Check padel timetable
+
+      - name: Install deps
+        run: |
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Check padel timetable (Playwright)
         env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}   # one or many IDs, comma separated
-          # --- Optional filters (set here or as repo "Variables") ---
+          TG_TOKEN:   ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}   # can be multiple, comma/semicolon separated
+          # --- Filters ---
           EARLIEST_HOUR: "18"
           LATEST_HOUR:   "22"
           DAYS_AHEAD:    "2"
           WEEKENDS_OK:   "true"
           WEEKDAYS_OK:   "true"
-        run: python checker.py
+          ACTIVITY_NAME: "Padel"
+        run: python checker_pw.py
