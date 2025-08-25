@@ -1,123 +1,200 @@
-import os, re, sys, datetime as dt
+# checker_pw.py
+import os, re, sys, time, datetime as dt
+from playwright.sync_api import sync_playwright
 import requests
-from bs4 import BeautifulSoup
 
-# ====== CONFIG (set via GitHub "Secrets" and "Variables") ======
-CENTRE_URL   = "https://www.placesleisure.org/centres/the-triangle/centre-activities/sports/"
-KEYWORD      = os.getenv("KEYWORD", "Padel")
-EARLIEST_HH  = int(os.getenv("EARLIEST_HOUR", "18"))  # 24h clock (inclusive)
-LATEST_HH    = int(os.getenv("LATEST_HOUR",   "22"))  # 24h clock (exclusive)
-DAYS_AHEAD   = int(os.getenv("DAYS_AHEAD",    "2"))   # today + next N days
-WEEKENDS_OK  = os.getenv("WEEKENDS_OK", "true").lower() == "true"
-WEEKDAYS_OK  = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
+CENTRE_PAGE = "https://www.placesleisure.org/centres/the-triangle/centre-activities/sports/"
+LH_BOOKINGS = "https://pfpleisure-pochub.org/LhWeb/en/Public/Bookings"  # fallback path (their Leisure Hub)
+ACTIVITY_NAME = os.getenv("ACTIVITY_NAME", "Padel")
 
-TG_TOKEN     = os.getenv("TG_TOKEN")
-TG_CHAT_IDS  = os.getenv("TG_CHAT_ID", "")  # one or many IDs, comma/semicolon separated
+EARLIEST_HOUR = int(os.getenv("EARLIEST_HOUR", "18"))
+LATEST_HOUR   = int(os.getenv("LATEST_HOUR",   "22"))  # exclusive
+DAYS_AHEAD    = int(os.getenv("DAYS_AHEAD",    "2"))
+WEEKENDS_OK   = os.getenv("WEEKENDS_OK", "true").lower() == "true"
+WEEKDAYS_OK   = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 
-def normalise(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+TG_TOKEN   = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-def fetch(url: str) -> str:
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    return r.text
-
-def extract_padel_timetable_link(html: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-    headings = soup.find_all(["h2", "h3", "h4"])
-    target = next((h for h in headings if normalise(h.get_text()).lower() == "padel"), None)
-    if not target:
-        return None
-    for a in target.find_all_next("a", href=True, limit=20):
-        txt = normalise(a.get_text()).lower()
-        if "timetable" in txt or "book" in txt:
-            href = a["href"]
-            if href.startswith("/"):
-                href = "https://www.placesleisure.org" + href
-            return href
-    return None
-
-def parse_slots(timetable_html: str):
-    soup = BeautifulSoup(timetable_html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        if re.search(r"\bbook\b", a.get_text(strip=True), re.I):
-            block = a.find_parent()
-            text = normalise(block.get_text(" ")) if block else normalise(a.get_text(" "))
-            if not re.search(KEYWORD, text, re.I):
-                continue
-            m_time = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", text)
-            m_day  = re.search(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", text, re.I)
-            if not m_time:
-                continue
-            href = a["href"]
-            if href.startswith("/"):
-                href = "https://www.placesleisure.org" + href
-            out.append({
-                "time": m_time.group(0),
-                "day":  (m_day.group(0).capitalize() if m_day else ""),
-                "href": href,
-                "raw":  text[:300]
-            })
-    return out
-
-def slot_allowed(slot) -> bool:
-    today = dt.date.today()
-    valid_days = [(today + dt.timedelta(days=i)).strftime("%A") for i in range(DAYS_AHEAD + 1)]
-    if slot["day"] and slot["day"] not in valid_days:
-        return False
-    day = slot["day"] or today.strftime("%A")
-    is_weekend = day in ("Saturday", "Sunday")
-    if is_weekend and not WEEKENDS_OK: return False
-    if (not is_weekend) and not WEEKDAYS_OK: return False
-    hh = int(slot["time"].split(":")[0])
-    return EARLIEST_HH <= hh < LATEST_HH
-
-def tg_send(text: str):
-    # Accept one or many chat IDs (comma or semicolon separated)
-    raw = TG_CHAT_IDS or ""
-    ids = []
-    for chunk in raw.replace(";", ",").split(","):
-        cid = chunk.strip()
-        if cid:
-            ids.append(cid)
-    if not TG_TOKEN or not ids:
-        print("Telegram not configured (missing TG_TOKEN or TG_CHAT_ID).")
+def tg_send(msg: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("Telegram not configured")
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for cid in ids:
+    for cid in [c.strip() for c in re.split(r"[;,]", TG_CHAT_ID) if c.strip()]:
         try:
-            requests.post(url, json={
-                "chat_id": cid,
-                "text": text,
-                "disable_web_page_preview": True
-            }, timeout=20)
+            requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id": cid, "text": msg, "disable_web_page_preview": True},
+                timeout=20
+            )
         except Exception as e:
             print(f"Telegram send failed for {cid}: {e}")
 
+def slot_ok(day_str: str, time_str: str) -> bool:
+    today = dt.date.today()
+    valid_days = [(today + dt.timedelta(days=i)).strftime("%A") for i in range(DAYS_AHEAD + 1)]
+    day_str = (day_str or "").strip()
+    if day_str and day_str not in valid_days:
+        return False
+    # weekday/weekend filter
+    check_day = day_str or today.strftime("%A")
+    is_weekend = check_day in ("Saturday", "Sunday")
+    if is_weekend and not WEEKENDS_OK: return False
+    if (not is_weekend) and not WEEKDAYS_OK: return False
+    # time filter
+    try:
+        hh = int(time_str.split(":")[0])
+    except Exception:
+        return False
+    return EARLIEST_HOUR <= hh < LATEST_HOUR
+
+def extract_from_cards(texts):
+    """texts: list of surrounding text blocks near 'Book' buttons"""
+    slots = []
+    for t in texts:
+        # try to pull weekday + hh:mm
+        m_time = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", t)
+        m_day  = re.search(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b", t, re.I)
+        if m_time:
+            day = (m_day.group(0).capitalize() if m_day else "")
+            tm  = m_time.group(0)
+            if slot_ok(day, tm):
+                slots.append((day, tm))
+    # de-dupe
+    return sorted(set(slots))
+
+def scrape_with_playwright():
+    found = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+
+        # --- Try centre sports page first (it’s already scoped to The Triangle) ---
+        try:
+            page.goto(CENTRE_PAGE, timeout=60000)
+            # Dismiss cookie banners if present
+            for label in ("Accept", "I agree", "Allow all"):
+                loc = page.get_by_role("button", name=re.compile(label, re.I))
+                if loc.count():
+                    loc.first.click(timeout=2000)
+                    break
+            # jump to timetable anchor if present
+            try:
+                page.locator('a[href="#timetable"]').first.click(timeout=2000)
+            except Exception:
+                pass
+
+            # Try native <select> first
+            # Select option that contains "Padel"
+            selects = page.locator("select")
+            selected = False
+            for i in range(selects.count()):
+                sel = selects.nth(i)
+                opts = sel.locator("option")
+                all_opts = [opts.nth(j).inner_text().strip() for j in range(opts.count())]
+                if any(re.search(r"\bpadel\b", o, re.I) for o in all_opts):
+                    sel.select_option(label=re.compile(r"padel", re.I))
+                    selected = True
+                    break
+
+            # If it's a custom dropdown, click it and pick "Padel"
+            if not selected:
+                # Look for any combobox / button that opens an activity list
+                candidates = page.locator('[role="combobox"], .select, button, [data-role="dropdown"]')
+                if candidates.count():
+                    try:
+                        candidates.first.click()
+                        dd = page.locator("text=Padel").first
+                        dd.click(timeout=4000)
+                        selected = True
+                    except Exception:
+                        pass
+
+            # wait for results to render (cards with Book buttons)
+            page.wait_for_timeout(4000)
+            book_btns = page.get_by_role("link", name=re.compile(r"\bbook\b", re.I))
+            if book_btns.count() == 0:
+                # sometimes 'Book' may be a button, not link
+                book_btns = page.get_by_role("button", name=re.compile(r"\bbook\b", re.I))
+
+            texts = []
+            for i in range(min(book_btns.count(), 50)):
+                btn = book_btns.nth(i)
+                # get some surrounding text
+                parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
+                try:
+                    t = parent.inner_text(timeout=1000)
+                except Exception:
+                    t = btn.inner_text()
+                texts.append(t)
+
+            found = extract_from_cards(texts)
+        except Exception as e:
+            print(f"Sports page scrape failed: {e}")
+
+        # --- Fallback: LhWeb 'Available bookings' page (site-wide), then filter ---
+        if not found:
+            try:
+                page.goto(LH_BOOKINGS, timeout=60000)
+                # Accept cookies if any
+                for label in ("Accept", "I agree", "Allow all"):
+                    loc = page.get_by_role("button", name=re.compile(label, re.I))
+                    if loc.count():
+                        loc.first.click(timeout=2000)
+                        break
+
+                # Try to open site selector and choose 'The Triangle'
+                # (different instances label it 'Select Site' or just 'Site')
+                site_boxes = page.get_by_role("combobox")
+                for i in range(site_boxes.count()):
+                    try:
+                        site_boxes.nth(i).select_option(label=re.compile(r"\btriangle\b", re.I))
+                        break
+                    except Exception:
+                        pass
+
+                # If a typed search exists, try typing 'Padel'
+                try:
+                    inp = page.get_by_role("textbox").first
+                    inp.fill("Padel")
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+
+                page.wait_for_timeout(4000)
+                book_btns = page.get_by_role("link", name=re.compile(r"\bbook\b", re.I))
+                if book_btns.count() == 0:
+                    book_btns = page.get_by_role("button", name=re.compile(r"\bbook\b", re.I))
+
+                texts = []
+                for i in range(min(book_btns.count(), 50)):
+                    btn = book_btns.nth(i)
+                    parent = btn.locator("xpath=ancestor::*[self::div or self::li][1]")
+                    try:
+                        t = parent.inner_text(timeout=1000)
+                    except Exception:
+                        t = btn.inner_text()
+                    # Only keep cards that mention Padel
+                    if re.search(r"\bpadel\b", t, re.I):
+                        texts.append(t)
+
+                found = extract_from_cards(texts)
+            except Exception as e:
+                print(f"LhWeb scrape failed: {e}")
+
+        ctx.close()
+        browser.close()
+    return found
+
 def main():
-    try:
-        base = fetch(CENTRE_URL)
-    except Exception as e:
-        print(f"Fetch centre page failed: {e}")
-        return 0
-    link = extract_padel_timetable_link(base)
-    if not link:
-        print("Couldn’t locate the Padel timetable link (layout may have changed).")
-        return 0
-    try:
-        thtml = fetch(link)
-    except Exception as e:
-        print(f"Fetch timetable failed: {e}")
-        return 0
-    slots = [s for s in parse_slots(thtml) if slot_allowed(s)]
+    slots = scrape_with_playwright()
     if not slots:
         print("No matching slots.")
         return 0
-    lines = []
-    for s in slots:
-        lines.append(f"{s['day'] or '(day tbc)'} {s['time']} — Padel\n{s['href']}")
-    msg = "🎾 Padel at The Triangle — slots found:\n\n" + "\n\n".join(lines)
+
+    lines = [f"{d or '(day tbc)'} {t} — Padel at The Triangle" for (d, t) in slots]
+    msg = "🎾 Padel — slots found:\n\n" + "\n".join(lines) + "\n\nBook via the Triangle page → Sports → Padel."
     print(msg)
     tg_send(msg)
     return 0
