@@ -1,0 +1,29 @@
+name: Padel Watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch: {}       # lets you run it manually from the Actions tab
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests beautifulsoup4
+      - name: Check padel timetable
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # --- Optional filters (edit or add as repo-level "Variables" instead) ---
+          EARLIEST_HOUR: "18"   # e.g. 17 = 5pm
+          LATEST_HOUR:   "22"   # exclusive upper bound
+          DAYS_AHEAD:    "2"    # today + next 2 days
+          WEEKENDS_OK:   "true"
+          WEEKDAYS_OK:   "true"
+        run: python checker.py
