@@ -27,7 +27,7 @@ BOT_USERNAME  = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
 
 # --- Notification throttling ---
 NOTIFY_LIMIT_PER_DATE       = int(os.getenv("NOTIFY_LIMIT_PER_DATE", "2"))   # send at most N messages per ISO date
-MAX_SLOTS_PER_DATE_SHOWN    = int(os.getenv("MAX_SLOTS_PER_DATE_SHOWN", "8"))  # cap lines shown per date (message length hygiene)
+MAX_SLOTS_PER_DATE_SHOWN    = int(os.getenv("MAX_SLOTS_PER_DATE_SHOWN", "8"))
 
 # Anti-dup behaviour: on first ever run, fast-forward to the latest update id silently
 FAST_FORWARD_UPDATES = os.getenv("FAST_FORWARD_UPDATES", "true").lower() == "true"
@@ -70,7 +70,6 @@ def tg_get_updates(offset: int | None) -> Dict:
         return {"ok": False, "result": []}
 
 def tg_ack_until(offset_after: int):
-    """Tell Telegram we've consumed up to update_id == offset_after-1, even if our state file didn't persist."""
     try:
         requests.get(
             f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
@@ -89,7 +88,7 @@ def _read_json(path: Path, default):
         pass
     return default
 
-def _write_json(path: Path, data):
+def _write_json(path: Path, data) -> bool:
     try:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return True
@@ -101,16 +100,16 @@ def load_targets() -> Set[str]:
     data = _read_json(TARGETS_FP, {"dates": []})
     return set(data.get("dates", []))
 
-def save_targets(dates: Set[str]):
-    _write_json(TARGETS_FP, {"dates": sorted(dates)})
+def save_targets(dates: Set[str]) -> bool:
+    return _write_json(TARGETS_FP, {"dates": sorted(dates)})
 
 # telegram last update id
 def load_last_update_id() -> int | None:
     data = _read_json(TGSTATE_FP, {"last_update_id": None})
     return data.get("last_update_id")
 
-def save_last_update_id(val: int | None):
-    _write_json(TGSTATE_FP, {"last_update_id": val})
+def save_last_update_id(val: int | None) -> bool:
+    return _write_json(TGSTATE_FP, {"last_update_id": val})
 
 # notified counts per date
 def load_notified_counts() -> Dict[str, int]:
@@ -118,12 +117,24 @@ def load_notified_counts() -> Dict[str, int]:
     raw = data.get("counts", {})
     return {str(k): int(v) for k, v in raw.items() if re.match(r"\d{4}-\d{2}-\d{2}", str(k))}
 
-def save_notified_counts(counts: Dict[str, int]):
-    _write_json(COUNTS_FP, {"counts": counts})
+def save_notified_counts(counts: Dict[str, int]) -> bool:
+    return _write_json(COUNTS_FP, {"counts": counts})
 
 # ----------------- Helpers -----------------
 TIME_RANGE_RE = re.compile(r"\b([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\b")
-DATE_RE       = re.compile(r"\d{4}-\d{2}-\d{2}")
+# accept YYYY-MM-DD or YYYY/MM/DD
+DATE_TOKEN_RE = re.compile(r"\b(\d{4})[-/](\d{2})[-/](\d{2})\b")
+
+def normalise_dates(text: str) -> Set[str]:
+    """Extract dates written as YYYY-MM-DD or YYYY/MM/DD and normalise to YYYY-MM-DD."""
+    out: Set[str] = set()
+    for y, m, d in DATE_TOKEN_RE.findall(text or ""):
+        try:
+            iso = dt.date(int(y), int(m), int(d)).isoformat()
+            out.add(iso)
+        except ValueError:
+            pass
+    return out
 
 def _zstamp_for_date(d: dt.date) -> str:
     return f"{d.isoformat()}T{START_HOUR_Z:02d}:00:00.000Z"
@@ -174,7 +185,6 @@ def _parse_day(page, d: dt.date):
         start = f"{m.group(1)}:{m.group(2)}"
         if not _within_filters(d, start):
             continue
-        # Require at least one button (book/add)
         if not c.get_by_role("button").count():
             continue
         qs = _zstamp_for_date(d)
@@ -189,7 +199,7 @@ def collect_slots() -> List[Tuple[str, str, str, str, str]]:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context()
         page = ctx.new_page()
-        for offset in range(SCAN_DAYS + 1):  # today + N days
+        for offset in range(SCAN_DAYS + 1):
             d = today + dt.timedelta(days=offset)
             qs = _zstamp_for_date(d)
             url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={qs}&previousActivityDate={qs}"
@@ -199,7 +209,6 @@ def collect_slots() -> List[Tuple[str, str, str, str, str]]:
             all_slots.extend(_parse_day(page, d))
         ctx.close()
         browser.close()
-    # De-dupe by (date, start-time)
     seen, uniq = set(), []
     for s in all_slots:
         k = (s[0], s[2])
@@ -249,7 +258,8 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
         max_id = max(max_id, upd.get("update_id", 0))
         msg = upd.get("message") or {}
         text = (msg.get("text") or "").strip()
-        chat_id = str(msg.get("chat", {}).get("id", ""))
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
         if not text or not chat_id:
             continue
         cmd, tail = _normalise_command(text)
@@ -258,18 +268,23 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
         notify_ids.add(chat_id)
 
         if cmd in ("/want", "/add"):
-            dates = set(DATE_RE.findall(tail))
-            if dates:
-                targets |= dates
-                save_targets(targets)
-                tg_send("✅ Added:\n" + "\n".join(sorted(dates)), chat_id)
+            parsed = normalise_dates(tail)
+            if parsed:
+                targets |= parsed
+                ok = save_targets(targets)
+                if ok:
+                    tg_send("✅ *Saved* target date(s):\n" + "\n".join(sorted(parsed)) +
+                            "\n\n🎯 Now watching:\n" + ("\n".join(sorted(targets)) if targets else "None"),
+                            chat_id)
+                else:
+                    tg_send("❌ Could not persist targets to disk. I’ll still try, but please re-run the command.", chat_id)
             else:
-                tg_send("Usage: /want YYYY-MM-DD [YYYY-MM-DD ...]", chat_id)
+                tg_send("⚠️ I couldn’t read any dates.\nUse `YYYY-MM-DD` *or* `YYYY/MM/DD`.\nExample: `/want 2025-08-29 2025/09/01`", chat_id)
 
         elif cmd == "/clear":
             targets.clear()
-            save_targets(targets)
-            tg_send("🧹 Cleared targets.", chat_id)
+            ok = save_targets(targets)
+            tg_send(("🧹 Cleared targets. ✅" if ok else "❌ Failed to persist clear to disk."), chat_id)
 
         elif cmd == "/list":
             tg_send("🎯 Watching:\n" + ("\n".join(sorted(targets)) if targets else "No targets set."), chat_id)
@@ -277,7 +292,7 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
         elif cmd in ("/help", "/start"):
             tg_send(
                 "Commands:\n"
-                "/want YYYY-MM-DD …\n"
+                "/want YYYY-MM-DD …  (also accepts YYYY/MM/DD)\n"
                 "/add YYYY-MM-DD …\n"
                 "/list\n"
                 "/clear\n"
@@ -295,12 +310,12 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
                 tg_send("🛎️ No notification counts yet.", chat_id)
 
         elif cmd in ("/forget_all", "/unnotify_all"):
-            save_notified_counts({})
-            tg_send("🧹 Cleared all per-date notification counts.", chat_id)
+            ok = save_notified_counts({})
+            tg_send(("🧹 Cleared all per-date notification counts. ✅" if ok else "❌ Failed to reset counts."), chat_id)
 
     save_last_update_id(max_id)
     tg_ack_until(max_id + 1)
-    save_targets(targets)
+    save_targets(targets)  # best-effort
     return targets, notify_ids
 
 # ----------------- Auto-prune past target dates -----------------
