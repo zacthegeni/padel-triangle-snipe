@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os, re, sys, json, traceback
@@ -29,6 +29,9 @@ BOT_USERNAME  = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
 NOTIFY_LIMIT_PER_DATE       = int(os.getenv("NOTIFY_LIMIT_PER_DATE", "2"))   # at most N messages per date
 MAX_SLOTS_PER_DATE_SHOWN    = int(os.getenv("MAX_SLOTS_PER_DATE_SHOWN", "8"))
 
+# --- Telegram safety: keep under 4096 chars (headroom) ---
+MAX_MSG_CHARS               = int(os.getenv("MAX_MSG_CHARS", "3500"))
+
 # Skip historic Telegram backlog on first ever run
 FAST_FORWARD_UPDATES = os.getenv("FAST_FORWARD_UPDATES", "true").lower() == "true"
 
@@ -50,32 +53,43 @@ def _post_telegram(payload: dict) -> bool:
             timeout=20,
         )
         if r.status_code != 200:
-            # Truncate server message to avoid noisy logs
+            txt = ""
             try:
                 txt = r.text
             except Exception:
                 txt = "<no body>"
-            print(f"Telegram error {r.status_code}: {txt[:200]}")
+            print(f"Telegram error {r.status_code}: {txt[:300]}")
             return False
         return True
     except Exception as e:
         print(f"Telegram send exception: {e}")
         return False
 
-def tg_send(msg: str, chat_ids: str | None = None):
-    """Plain-text send (no parse_mode). URLs will still auto-link."""
+def tg_send(msg: str, chat_ids: str | None = None) -> bool:
+    """Plain-text send (no parse_mode). URLs auto-link. Returns True if at least one chat succeeded."""
     if not TG_TOKEN:
-        return
+        return False
     ids = (chat_ids or TG_CHAT_ID or "").strip()
     if not ids:
-        return
+        return False
+    ok_any = False
     for cid in [c.strip() for c in re.split(r"[;,]", ids) if c.strip()]:
         payload = {
             "chat_id": cid,
             "text": msg,
             "disable_web_page_preview": True,
         }
-        _post_telegram(payload)
+        if _post_telegram(payload):
+            ok_any = True
+    return ok_any
+
+def tg_send_to_all(msg: str, extra_ids: Set[str]) -> bool:
+    """Send to default TG_CHAT_ID and also to any extra chat IDs (from interactive chats)."""
+    ok = tg_send(msg)
+    for cid in extra_ids:
+        tg_send(msg, cid)
+        ok = True or ok
+    return ok
 
 def tg_get_updates(offset: int | None) -> Dict:
     if not TG_TOKEN:
@@ -291,14 +305,13 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
             if parsed:
                 targets |= parsed
                 ok = save_targets(targets)
-                if ok:
-                    tg_send(
-                        "Saved target date(s):\n" + "\n".join(sorted(parsed)) +
-                        "\n\nWatching:\n" + ("\n".join(sorted(targets)) if targets else "None"),
-                        chat_id
-                    )
-                else:
-                    tg_send("Could not persist targets to disk. I’ll still try, but please re-run the command.", chat_id)
+                tg_send(
+                    ("Saved target date(s):\n" + "\n".join(sorted(parsed)) +
+                     "\n\nWatching:\n" + ("\n".join(sorted(targets)) if targets else "None"))
+                    if ok else
+                    "Could not persist targets to disk. I’ll still try, but please re-run the command.",
+                    chat_id
+                )
             else:
                 tg_send("I couldn’t read any dates. Use YYYY-MM-DD or YYYY/MM/DD.\nExample: /want 2025-08-29 2025/09/01", chat_id)
 
@@ -348,6 +361,38 @@ def prune_expired_targets(targets: Set[str]) -> Tuple[Set[str], Set[str]]:
         save_targets(targets)
     return targets, removed
 
+# ----------------- Message building (per-date + safe length) -----------------
+def build_date_messages(date_iso: str, entries: List[Tuple[str, str, str, str, str]]) -> List[str]:
+    """Return one or more safe-length messages for a single date."""
+    # Header
+    day_name = entries[0][1]
+    total = len(entries)
+    header = f"Padel availability — {date_iso} ({day_name})\n"
+
+    # Slot lines (cap display count)
+    lines = []
+    shown = 0
+    for _, _, time_s, act, url in entries:
+        if shown >= MAX_SLOTS_PER_DATE_SHOWN:
+            break
+        lines.append(f"• {time_s} — {act}\n  {url}")
+        shown += 1
+    if total > MAX_SLOTS_PER_DATE_SHOWN:
+        lines.append(f"…and {total - MAX_SLOTS_PER_DATE_SHOWN} more")
+
+    # Chunk to safe size
+    msgs = []
+    cur = header
+    for line in lines:
+        if len(cur) + len(line) + 1 > MAX_MSG_CHARS:
+            msgs.append(cur.rstrip())
+            cur = header + "(continued)\n" + line + "\n"
+        else:
+            cur += line + "\n"
+    if cur.strip():
+        msgs.append(cur.rstrip())
+    return msgs
+
 # ----------------- Main -----------------
 def main():
     try:
@@ -356,9 +401,7 @@ def main():
         if removed:
             msg = "Removed past target dates:\n" + "\n".join(sorted(removed))
             print(msg)
-            tg_send(msg)
-            for cid in notify_ids:
-                tg_send(msg, cid)
+            tg_send_to_all(msg, notify_ids)
 
         slots = collect_slots()
         if targets:
@@ -384,32 +427,19 @@ def main():
             print("Slots found, but all dates have reached the notification limit. No new notifications.")
             return 0
 
-        # Build one compact plain-text message covering all eligible dates
-        lines = ["Padel availability:"]
+        # Send one (chunk-safe) message per eligible date; increment that date’s count if at least one send succeeds
         for d in eligible_dates:
-            day_name = by_date[d][0][1]
-            total = len(by_date[d])
-            lines.append(f"\n{d} — {day_name} ({total} slot{'s' if total != 1 else ''})")
-            shown = 0
-            for iso, day, time_s, act, url in by_date[d]:
-                if shown >= MAX_SLOTS_PER_DATE_SHOWN:
-                    break
-                lines.append(f"• {time_s} — {act}\n  {url}")
-                shown += 1
-            if total > MAX_SLOTS_PER_DATE_SHOWN:
-                lines.append(f"…and {total - MAX_SLOTS_PER_DATE_SHOWN} more")
-
-        msg = "\n".join(lines)
-        print(msg)
-        tg_send(msg)
-        for cid in notify_ids:
-            tg_send(msg, cid)
-
-        # Increment per-date counts (we sent one message that covered these dates)
-        for d in eligible_dates:
-            counts[d] = counts.get(d, 0) + 1
+            messages = build_date_messages(d, by_date[d])
+            sent_any = False
+            for piece in messages:
+                if tg_send_to_all(piece, notify_ids):
+                    sent_any = True
+            if sent_any:
+                counts[d] = counts.get(d, 0) + 1
         save_notified_counts(counts)
 
+        # Also print a compact summary to Actions logs
+        print("Sent notifications for dates:", ", ".join(eligible_dates))
         return 0
 
     except Exception:
