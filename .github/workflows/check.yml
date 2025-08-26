@@ -48,13 +48,19 @@ jobs:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BOT_USERNAME: "padelsniper_bot"
-          SCAN_DAYS: "14"
+
+          # --- scan & filters ---
+          SCAN_DAYS: "45"            # scan further ahead to catch cancellations
+          START_HOUR_Z: "5"
           EARLIEST_HOUR: "0"
           LATEST_HOUR: "24"
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
           ACTIVITY_ID: "149A001015"
-          START_HOUR_Z: "5"
+
+          # --- notification throttle ---
+          NOTIFY_LIMIT_PER_DATE: "2"       # <= your request: after 2 pings for a date, stay silent
+          MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
       - name: Upload debug screenshots
@@ -73,7 +79,7 @@ jobs:
             git config user.email "padel-bot@users.noreply.github.com"
             git add state/*.json || true
             git commit -m "update state [skip ci]" || true
-            git push
+            git push || true
           fi
 
   keepalive:
