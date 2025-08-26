@@ -1,7 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os, re, sys, json, traceback
 import datetime as dt
 from pathlib import Path
-from typing import Dict, Tuple, Set
+from typing import Dict, Tuple, Set, List
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import requests
@@ -16,18 +19,24 @@ LATEST_HOUR   = int(os.getenv("LATEST_HOUR",   "24"))
 WEEKENDS_OK   = os.getenv("WEEKENDS_OK", "true").lower() == "true"
 WEEKDAYS_OK   = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 
-SCAN_DAYS     = int(os.getenv("SCAN_DAYS", "14"))  # today + N days
+SCAN_DAYS     = int(os.getenv("SCAN_DAYS", "45"))  # today + N days (wider to catch cancellations)
 
 TG_TOKEN      = os.getenv("TG_TOKEN")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "")
 BOT_USERNAME  = os.getenv("BOT_USERNAME", "").lower().lstrip("@")
 
+# --- Notification throttling ---
+NOTIFY_LIMIT_PER_DATE       = int(os.getenv("NOTIFY_LIMIT_PER_DATE", "2"))   # send at most N messages per ISO date
+MAX_SLOTS_PER_DATE_SHOWN    = int(os.getenv("MAX_SLOTS_PER_DATE_SHOWN", "8"))  # cap lines shown per date (message length hygiene)
+
 # Anti-dup behaviour: on first ever run, fast-forward to the latest update id silently
 FAST_FORWARD_UPDATES = os.getenv("FAST_FORWARD_UPDATES", "true").lower() == "true"
 
+# ----------------- State -----------------
 STATE_DIR   = Path("state"); STATE_DIR.mkdir(exist_ok=True)
-TARGETS_FP  = STATE_DIR / "targets.json"
-TGSTATE_FP  = STATE_DIR / "tg_last_update.json"
+TARGETS_FP  = STATE_DIR / "targets.json"           # user /want dates
+TGSTATE_FP  = STATE_DIR / "tg_last_update.json"    # last telegram update id
+COUNTS_FP   = STATE_DIR / "notified_counts.json"   # per-date notification counts
 
 DEBUG_DIR = Path("debug"); DEBUG_DIR.mkdir(exist_ok=True)
 
@@ -71,7 +80,7 @@ def tg_ack_until(offset_after: int):
     except Exception:
         pass
 
-# ----------------- State -----------------
+# ----------------- JSON helpers -----------------
 def _read_json(path: Path, default):
     try:
         if path.exists():
@@ -87,6 +96,7 @@ def _write_json(path: Path, data):
     except Exception:
         return False
 
+# targets (dates user wants)
 def load_targets() -> Set[str]:
     data = _read_json(TARGETS_FP, {"dates": []})
     return set(data.get("dates", []))
@@ -94,6 +104,7 @@ def load_targets() -> Set[str]:
 def save_targets(dates: Set[str]):
     _write_json(TARGETS_FP, {"dates": sorted(dates)})
 
+# telegram last update id
 def load_last_update_id() -> int | None:
     data = _read_json(TGSTATE_FP, {"last_update_id": None})
     return data.get("last_update_id")
@@ -101,8 +112,18 @@ def load_last_update_id() -> int | None:
 def save_last_update_id(val: int | None):
     _write_json(TGSTATE_FP, {"last_update_id": val})
 
+# notified counts per date
+def load_notified_counts() -> Dict[str, int]:
+    data = _read_json(COUNTS_FP, {"counts": {}})
+    raw = data.get("counts", {})
+    return {str(k): int(v) for k, v in raw.items() if re.match(r"\d{4}-\d{2}-\d{2}", str(k))}
+
+def save_notified_counts(counts: Dict[str, int]):
+    _write_json(COUNTS_FP, {"counts": counts})
+
 # ----------------- Helpers -----------------
 TIME_RANGE_RE = re.compile(r"\b([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)\b")
+DATE_RE       = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 def _zstamp_for_date(d: dt.date) -> str:
     return f"{d.isoformat()}T{START_HOUR_Z:02d}:00:00.000Z"
@@ -138,10 +159,11 @@ def _robust_wait(page):
 def _parse_day(page, d: dt.date):
     slots = []
     cards = page.locator("div").filter(has_text=re.compile(r"\d{2}:\d{2}\s*-\s*\d{2}:\d{2}"))
-    for i in range(min(cards.count(), 400)):
+    n = min(cards.count(), 500)
+    for i in range(n):
         c = cards.nth(i)
         try:
-            txt = (c.inner_text(timeout=500) or "").strip()
+            txt = (c.inner_text(timeout=700) or "").strip()
         except Exception:
             continue
         if not txt or "unavailable" in txt.lower():
@@ -152,6 +174,7 @@ def _parse_day(page, d: dt.date):
         start = f"{m.group(1)}:{m.group(2)}"
         if not _within_filters(d, start):
             continue
+        # Require at least one button (book/add)
         if not c.get_by_role("button").count():
             continue
         qs = _zstamp_for_date(d)
@@ -159,9 +182,9 @@ def _parse_day(page, d: dt.date):
         slots.append((d.isoformat(), d.strftime("%A"), start, "Padel Tennis", url))
     return slots
 
-def collect_slots():
+def collect_slots() -> List[Tuple[str, str, str, str, str]]:
     today = dt.date.today()
-    all_slots = []
+    all_slots: List[Tuple[str, str, str, str, str]] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context()
@@ -176,6 +199,7 @@ def collect_slots():
             all_slots.extend(_parse_day(page, d))
         ctx.close()
         browser.close()
+    # De-dupe by (date, start-time)
     seen, uniq = set(), []
     for s in all_slots:
         k = (s[0], s[2])
@@ -186,8 +210,6 @@ def collect_slots():
     return uniq
 
 # ----------------- Telegram commands -----------------
-DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-
 def _normalise_command(text: str) -> Tuple[str, str]:
     t = (text or "").strip()
     if not t: return "", ""
@@ -213,7 +235,6 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
         if res0.get("ok") and res0.get("result"):
             max_seen = max(u.get("update_id", 0) for u in res0["result"])
             save_last_update_id(max_seen)
-            # Also ack to Telegram so the queue is advanced even if state commit fails
             tg_ack_until(max_seen + 1)
         return targets, set()
 
@@ -235,22 +256,48 @@ def handle_commands() -> Tuple[Set[str], Set[str]]:
         if not cmd:
             continue
         notify_ids.add(chat_id)
+
         if cmd in ("/want", "/add"):
             dates = set(DATE_RE.findall(tail))
             if dates:
                 targets |= dates
+                save_targets(targets)
                 tg_send("✅ Added:\n" + "\n".join(sorted(dates)), chat_id)
             else:
                 tg_send("Usage: /want YYYY-MM-DD [YYYY-MM-DD ...]", chat_id)
+
         elif cmd == "/clear":
             targets.clear()
+            save_targets(targets)
             tg_send("🧹 Cleared targets.", chat_id)
+
         elif cmd == "/list":
             tg_send("🎯 Watching:\n" + ("\n".join(sorted(targets)) if targets else "No targets set."), chat_id)
-        elif cmd in ("/help", "/start"):
-            tg_send("Commands:\n/want YYYY-MM-DD …\n/add YYYY-MM-DD …\n/list\n/clear", chat_id)
 
-    # Persist state AND forcibly ack to Telegram so duplicates cannot recur
+        elif cmd in ("/help", "/start"):
+            tg_send(
+                "Commands:\n"
+                "/want YYYY-MM-DD …\n"
+                "/add YYYY-MM-DD …\n"
+                "/list\n"
+                "/clear\n"
+                "/notified  (show per-date notification counts)\n"
+                "/forget_all  (reset all counts)\n",
+                chat_id
+            )
+
+        elif cmd in ("/notified", "/seen"):
+            nd = load_notified_counts()
+            if nd:
+                rows = [f"{d}: {nd.get(d,0)}/{NOTIFY_LIMIT_PER_DATE}" for d in sorted(nd)]
+                tg_send("🛎️ Notified counts per date:\n" + "\n".join(rows), chat_id)
+            else:
+                tg_send("🛎️ No notification counts yet.", chat_id)
+
+        elif cmd in ("/forget_all", "/unnotify_all"):
+            save_notified_counts({})
+            tg_send("🧹 Cleared all per-date notification counts.", chat_id)
+
     save_last_update_id(max_id)
     tg_ack_until(max_id + 1)
     save_targets(targets)
@@ -285,12 +332,49 @@ def main():
             print("No matching slots.")
             return 0
 
-        lines = [f"{iso} ({day}) {time} — {act}\n🔗 {url}" for (iso, day, time, act, url) in slots]
-        msg = "🎾 *Padel slots found:*\n\n" + "\n\n".join(lines)
+        # Group slots by ISO date
+        by_date: Dict[str, List[Tuple[str, str, str, str, str]]] = {}
+        for iso, day, time_s, act, url in slots:
+            by_date.setdefault(iso, []).append((iso, day, time_s, act, url))
+        for iso in list(by_date.keys()):
+            by_date[iso].sort(key=lambda x: x[2])  # sort by time
+
+        # Load per-date notification counts and decide eligibility
+        counts = load_notified_counts()
+        eligible_dates = [d for d in sorted(by_date.keys())
+                          if counts.get(d, 0) < NOTIFY_LIMIT_PER_DATE]
+
+        if not eligible_dates:
+            print("Slots found, but all dates have reached the notification limit. No new notifications.")
+            return 0
+
+        # Build one compact message covering all eligible dates (to prevent spamming)
+        lines = []
+        for d in eligible_dates:
+            day_name = by_date[d][0][1]
+            total = len(by_date[d])
+            header = f"📅 {d} — {day_name} ({total} slot{'s' if total != 1 else ''})"
+            lines.append(header)
+            shown = 0
+            for iso, day, time_s, act, url in by_date[d]:
+                if shown >= MAX_SLOTS_PER_DATE_SHOWN:
+                    break
+                lines.append(f"• {time_s} — {act}\n  🔗 {url}")
+                shown += 1
+            if total > MAX_SLOTS_PER_DATE_SHOWN:
+                lines.append(f"…and {total - MAX_SLOTS_PER_DATE_SHOWN} more")
+
+        msg = "🎾 *Padel availability:*\n\n" + "\n".join(lines)
         print(msg)
         tg_send(msg)
         for cid in notify_ids:
             tg_send(msg, cid)
+
+        # Increment per-date counts (we sent one message that covered these dates)
+        for d in eligible_dates:
+            counts[d] = counts.get(d, 0) + 1
+        save_notified_counts(counts)
+
         return 0
 
     except Exception:
