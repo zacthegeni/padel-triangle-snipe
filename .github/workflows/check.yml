@@ -17,13 +17,33 @@ jobs:
       cancel-in-progress: true
 
     steps:
+      # 1) Checkout your main code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # State lives on a dedicated branch so it always persists
-      - name: Checkout state branch
-        uses: actions/checkout@v4
+      # 2) Ensure the state branch exists (bootstrap if missing)
+      - name: Ensure padel-state branch exists
+        run: |
+          git fetch origin --quiet || true
+          if ! git ls-remote --exit-code --heads origin padel-state; then
+            echo "Initialising padel-state branch…"
+            git checkout --orphan padel-state
+            git reset --hard
+            mkdir -p state
+            echo "Padel state branch" > .padel-state-readme
+            git config user.name "padel-bot"
+            git config user.email "padel-bot@users.noreply.github.com"
+            git add .
+            git commit -m "init padel-state"
+            git push origin padel-state
+            git checkout -
+          else
+            echo "padel-state exists on remote."
+          fi
+
+      # 3) Check out the state branch into a side folder and restore state
+      - uses: actions/checkout@v4
         with:
           ref: padel-state
           path: .state_branch
@@ -39,6 +59,7 @@ jobs:
           fi
           ls -la state || true
 
+      # 4) Python + Playwright
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -54,6 +75,7 @@ jobs:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BOT_USERNAME: "padelsniper_bot"
+
           SCAN_DAYS: "45"
           START_HOUR_Z: "5"
           EARLIEST_HOUR: "0"
@@ -61,6 +83,7 @@ jobs:
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
           ACTIVITY_ID: "149A001015"
+
           NOTIFY_LIMIT_PER_SLOT: "2"
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
@@ -73,6 +96,7 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
+      # 5) Persist state back to padel-state (DB + targets etc.)
       - name: Persist state to branch
         if: always()
         run: |
@@ -83,7 +107,6 @@ jobs:
           git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
           git commit -m "update state [skip ci]" || true
-          # create branch if it doesn't exist
           git push origin HEAD:padel-state || true
 
   keepalive:
