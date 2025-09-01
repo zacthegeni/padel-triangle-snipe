@@ -1,13 +1,13 @@
 name: Padel Watcher
 
-permissions:
-  contents: write
-
 on:
   schedule:
-    - cron: "*/1 * * * *"   # run every minute
-    - cron: "0 0 1 * *"     # monthly keepalive
+    - cron: "*/1 * * * *"
+    - cron: "0 0 1 * *"
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   watch:
@@ -18,20 +18,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache pip
-        uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: pip-${{ runner.os }}-
+          fetch-depth: 0
 
-      - name: Cache Playwright
-        uses: actions/cache@v4
+      # State lives on a dedicated branch so it always persists
+      - name: Checkout state branch
+        uses: actions/checkout@v4
         with:
-          path: ~/.cache/ms-playwright
-          key: pw-${{ runner.os }}-chromium-1.47
-          restore-keys: pw-${{ runner.os }}-
+          ref: padel-state
+          path: .state_branch
+          fetch-depth: 0
+          persist-credentials: true
+          clean: false
+
+      - name: Restore state files
+        run: |
+          mkdir -p state
+          if [ -d .state_branch/state ]; then
+            cp -f .state_branch/state/* state/ 2>/dev/null || true
+          fi
+          ls -la state || true
 
       - uses: actions/setup-python@v5
         with:
@@ -48,18 +54,14 @@ jobs:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BOT_USERNAME: "padelsniper_bot"
-
-          # --- scan & filters ---
-          SCAN_DAYS: "45"            # scan further ahead to catch cancellations
+          SCAN_DAYS: "45"
           START_HOUR_Z: "5"
           EARLIEST_HOUR: "0"
           LATEST_HOUR: "24"
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
           ACTIVITY_ID: "149A001015"
-
-          # --- notification throttle ---
-          NOTIFY_LIMIT_PER_DATE: "2"       # <= your request: after 2 pings for a date, stay silent
+          NOTIFY_LIMIT_PER_SLOT: "2"
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
@@ -71,16 +73,18 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      - name: Persist state
+      - name: Persist state to branch
         if: always()
         run: |
-          if ! git diff --quiet -- state/; then
-            git config user.name "padel-bot"
-            git config user.email "padel-bot@users.noreply.github.com"
-            git add state/*.json || true
-            git commit -m "update state [skip ci]" || true
-            git push || true
-          fi
+          mkdir -p .state_branch/state
+          cp -f state/* .state_branch/state/ 2>/dev/null || true
+          cd .state_branch
+          git config user.name "padel-bot"
+          git config user.email "padel-bot@users.noreply.github.com"
+          git add state/* || true
+          git commit -m "update state [skip ci]" || true
+          # create branch if it doesn't exist
+          git push origin HEAD:padel-state || true
 
   keepalive:
     if: github.event_name == 'schedule' && github.event.schedule == '0 0 1 * *'
