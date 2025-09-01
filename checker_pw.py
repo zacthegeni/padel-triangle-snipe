@@ -338,4 +338,39 @@ def main():
         # group by date
         by_date: Dict[str, List[Tuple[str,str,str,str,str]]] = {}
         for iso,day,time_s,act,url in slots:
-            by_date.setdefault(iso, []).append((iso,day_
+            by_date.setdefault(iso, []).append((iso,day,time_s,act,url))
+        for iso in list(by_date.keys()):
+            by_date[iso].sort(key=lambda x:x[2])
+
+        # filter by per-slot cap via SQLite
+        eligible_by_date: Dict[str, List[Tuple[str,str,str,str,str]]] = {}
+        for d, items in by_date.items():
+            elig=[]
+            for iso,day,time_s,act,url in items:
+                key = f"{iso}|{time_s}"
+                if db_get_count(con, key) < NOTIFY_LIMIT_PER_SLOT:
+                    elig.append((iso,day,time_s,act,url))
+            if elig:
+                eligible_by_date[d]=elig
+
+        if not eligible_by_date:
+            print("Slots exist but all are beyond the per-slot limit; no messages sent.")
+            return 0
+
+        # send & increment
+        for d in sorted(eligible_by_date.keys()):
+            for piece in build_date_messages(d, eligible_by_date[d]):
+                tg_send(piece);  [tg_send(piece, cid) for cid in notify_ids]
+            for iso,_,time_s,_,_ in eligible_by_date[d]:
+                db_inc_count(con, f"{iso}|{time_s}")
+
+        print("Sent notifications.")
+        return 0
+
+    except Exception:
+        print("Error: unexpected exception in checker_pw.py")
+        traceback.print_exc(limit=2)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
