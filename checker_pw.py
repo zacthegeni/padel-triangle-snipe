@@ -302,7 +302,15 @@ def build_date_messages(date_iso: str, entries: List[Tuple[str,str,str,str,str]]
     lines, shown = [], 0
     for _,_,time_s,act,url in entries:
         if shown >= MAX_SLOTS_PER_DATE_SHOWN: break
-        lines.append(f"• {time_s} — {act}\n  {url}"); shown += 1
+        # --- Add +1 hour for display only ---
+        try:
+            hh, mm = map(int, time_s.split(":"))
+            hh = (hh + 1) % 24
+            display_time = f"{hh:02d}:{mm:02d}"
+        except Exception:
+            display_time = time_s
+        lines.append(f"• {display_time} — {act}\n  {url}")
+        shown += 1
     if total > MAX_SLOTS_PER_DATE_SHOWN:
         lines.append(f"…and {total - MAX_SLOTS_PER_DATE_SHOWN} more")
     msgs, cur = [], header
