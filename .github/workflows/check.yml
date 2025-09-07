@@ -2,8 +2,8 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/1 * * * *"      # every minute
-    - cron: "0 0 1 * *"        # monthly keepalive
+    - cron: "*/1 * * * *"
+    - cron: "0 0 1 * *"
   workflow_dispatch: {}
 
 permissions:
@@ -17,23 +17,20 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Use Playwright image (browsers & OS deps preinstalled)
+    # Use image with browsers & OS deps preinstalled
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
+      # (container already sets PLAYWRIGHT_BROWSERS_PATH=/ms-playwright)
 
     steps:
-      # 1) Checkout code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Ensure padel-state branch exists (first-run bootstrap)
       - name: Ensure padel-state branch exists
         working-directory: ${{ github.workspace }}
         run: |
-          # mark this workspace as safe for git (fixes "dubious ownership")
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
           git fetch origin --quiet || true
           if git ls-remote --exit-code --heads origin padel-state; then
             echo "padel-state exists on remote."
@@ -51,7 +48,6 @@ jobs:
             git checkout -
           fi
 
-      # 3) Restore state from padel-state branch
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -68,20 +64,20 @@ jobs:
           fi
           ls -la state || true
 
-      # 4) Python deps only (container already has browsers & OS deps)
+      # >>> Install Python deps (no apt, no --with-deps) <<<
       - name: Install Python deps
         run: |
           python --version
           pip install --upgrade pip
-          pip install requests   # playwright already present in image
+          pip install "playwright==1.47.0" requests
+          # sanity check
+          python -c "import playwright, sys; print('playwright', playwright.__version__); print(sys.executable)"
 
-      # 5) Run checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BOT_USERNAME: "padelsniper_bot"
-
           SCAN_DAYS: "45"
           START_HOUR_Z: "5"
           EARLIEST_HOUR: "0"
@@ -89,12 +85,10 @@ jobs:
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
           ACTIVITY_ID: "149A001015"
-
           NOTIFY_LIMIT_PER_SLOT: "2"
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
-      # 6) Upload debug artefacts (optional)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,7 +97,6 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 7) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
         working-directory: ${{ github.workspace }}/.state_branch
