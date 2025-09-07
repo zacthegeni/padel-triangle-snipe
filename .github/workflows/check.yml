@@ -17,7 +17,7 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Run inside Playwright image → browsers & system deps preinstalled
+    # Use Playwright image (browsers & OS deps preinstalled)
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
@@ -27,11 +27,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2) Ensure state branch exists (first-run bootstrap)
+      # 2) Ensure padel-state branch exists (first-run bootstrap)
       - name: Ensure padel-state branch exists
+        working-directory: ${{ github.workspace }}
         run: |
+          # mark this workspace as safe for git (fixes "dubious ownership")
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
           git fetch origin --quiet || true
-          if ! git ls-remote --exit-code --heads origin padel-state; then
+          if git ls-remote --exit-code --heads origin padel-state; then
+            echo "padel-state exists on remote."
+          else
             echo "Initialising padel-state branch…"
             git checkout --orphan padel-state
             git reset --hard
@@ -43,8 +49,6 @@ jobs:
             git commit -m "init padel-state"
             git push origin padel-state
             git checkout -
-          else
-            echo "padel-state exists."
           fi
 
       # 3) Restore state from padel-state branch
@@ -69,7 +73,7 @@ jobs:
         run: |
           python --version
           pip install --upgrade pip
-          pip install requests  # playwright already present in the container
+          pip install requests   # playwright already present in image
 
       # 5) Run checker
       - name: Run checker
@@ -102,10 +106,11 @@ jobs:
       # 7) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
+        working-directory: ${{ github.workspace }}/.state_branch
         run: |
-          mkdir -p .state_branch/state
-          cp -f state/* .state_branch/state/ 2>/dev/null || true
-          cd .state_branch
+          git config --global --add safe.directory "$PWD"
+          mkdir -p state
+          cp -f "${GITHUB_WORKSPACE}/state/"* state/ 2>/dev/null || true
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
