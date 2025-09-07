@@ -20,7 +20,6 @@ jobs:
     # Use image with browsers & OS deps preinstalled
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
-      # (container already sets PLAYWRIGHT_BROWSERS_PATH=/ms-playwright)
 
     steps:
       - uses: actions/checkout@v4
@@ -64,14 +63,18 @@ jobs:
           fi
           ls -la state || true
 
-      # >>> Install Python deps (no apt, no --with-deps) <<<
+      # Python deps only (container already has browsers & system deps)
       - name: Install Python deps
         run: |
           python --version
           pip install --upgrade pip
           pip install "playwright==1.47.0" requests
-          # sanity check
-          python -c "import playwright, sys; print('playwright', playwright.__version__); print(sys.executable)"
+          # non-fatal import check
+          python - <<'PY'
+import importlib, sys
+m = importlib.import_module("playwright")
+print("playwright import OK; executable:", sys.executable)
+PY
 
       - name: Run checker
         env:
