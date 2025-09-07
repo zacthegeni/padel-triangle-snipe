@@ -27,7 +27,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2) Ensure padel-state branch exists (same logic you had)
+      # 2) Mark repo safe for git inside container + set identity
+      - name: Configure git (safe dir & identity)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "padel-bot"
+          git config --global user.email "padel-bot@users.noreply.github.com"
+
+      # 3) Ensure padel-state branch exists (bootstrap if missing)
       - name: Ensure padel-state branch exists
         run: |
           git fetch origin --quiet || true
@@ -37,8 +44,6 @@ jobs:
             git reset --hard
             mkdir -p state
             echo "Padel state branch" > .padel-state-readme
-            git config user.name "padel-bot"
-            git config user.email "padel-bot@users.noreply.github.com"
             git add .
             git commit -m "init padel-state"
             git push origin padel-state
@@ -47,7 +52,7 @@ jobs:
             echo "padel-state exists on remote."
           fi
 
-      # 3) Pull state branch into a side folder and restore state
+      # 4) Pull state branch into a side folder and restore state
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -64,14 +69,14 @@ jobs:
           fi
           ls -la state || true
 
-      # 4) Python deps (PLAYWRIGHT + requests) — no browser install here
+      # 5) Python deps (Playwright + requests) — no browser install needed
       - name: Install Python deps
         run: |
           python3 --version
           python3 -m pip install --upgrade pip
           python3 -m pip install "playwright==1.47.0" requests
 
-      # 5) Run the checker (your script)
+      # 6) Run the checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
@@ -98,15 +103,13 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 6) Persist state back to padel-state
+      # 7) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
         run: |
           mkdir -p .state_branch/state
           cp -f state/* .state_branch/state/ 2>/dev/null || true
           cd .state_branch
-          git config user.name "padel-bot"
-          git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
           git commit -m "update state [skip ci]" || true
           git push origin HEAD:padel-state || true
@@ -120,9 +123,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Touch keepalive file and push
         run: |
-          date +%F > .keepalive
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
+          date +%F > .keepalive
           git add .keepalive || true
           git commit -m "keepalive [skip ci]" || true
           git push || true
