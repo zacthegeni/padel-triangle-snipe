@@ -2,14 +2,9 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/1 * * * *"      # every minute
-    - cron: "0 0 1 * *"        # monthly keepalive
+    - cron: "*/1 * * * *"    # every minute
+    - cron: "0 0 1 * *"      # monthly keepalive
   workflow_dispatch: {}
-  # Optional convenience trigger: edit .force-run on main to kick off a run
-  push:
-    branches: [ main ]
-    paths:
-      - ".force-run"
 
 permissions:
   contents: write
@@ -22,27 +17,21 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Use Playwright image (Chromium + system deps preinstalled)
+    # >>> Run inside Playwright image to avoid apt/deps installs <<<
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
     steps:
-      # 1) Checkout code (main)
+      # 1) Checkout your main code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Ensure padel-state branch exists (first-run bootstrap)
+      # 2) Ensure padel-state branch exists (bootstrap if missing)
       - name: Ensure padel-state branch exists
-        working-directory: ${{ github.workspace }}
         run: |
-          # fix "dubious ownership" inside container
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
           git fetch origin --quiet || true
-          if git ls-remote --exit-code --heads origin padel-state; then
-            echo "padel-state exists on remote."
-          else
+          if ! git ls-remote --exit-code --heads origin padel-state; then
             echo "Initialising padel-state branch…"
             git checkout --orphan padel-state
             git reset --hard
@@ -54,9 +43,11 @@ jobs:
             git commit -m "init padel-state"
             git push origin padel-state
             git checkout -
+          else
+            echo "padel-state exists on remote."
           fi
 
-      # 3) Restore state from padel-state into ./state
+      # 3) Pull state branch into a side folder and restore state
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -78,14 +69,10 @@ jobs:
         run: |
           python --version
           pip install --upgrade pip
-          pip install "playwright==1.47.0" requests
-          python - <<'PY'
-import importlib, sys
-importlib.import_module("playwright")
-print("playwright import OK; python:", sys.version.split()[0])
-PY
+          pip install playwright==1.47.0 requests
+          # DO NOT run "playwright install --with-deps" inside the container
 
-      # 5) Run checker
+      # 5) Run the checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
@@ -104,7 +91,6 @@ PY
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
-      # 6) Upload debug screenshots (if any)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -113,14 +99,13 @@ PY
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 7) Persist updated state back to padel-state branch
+      # 6) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
-        working-directory: ${{ github.workspace }}/.state_branch
         run: |
-          git config --global --add safe.directory "$PWD"
-          mkdir -p state
-          cp -f "${GITHUB_WORKSPACE}/state/"* state/ 2>/dev/null || true
+          mkdir -p .state_branch/state
+          cp -f state/* .state_branch/state/ 2>/dev/null || true
+          cd .state_branch
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
