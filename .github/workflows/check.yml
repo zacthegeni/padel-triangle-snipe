@@ -6,7 +6,6 @@ on:
     - cron: "0 0 1 * *"        # monthly keepalive
   workflow_dispatch: {}
 
-# Least privilege
 permissions:
   contents: write
 
@@ -18,7 +17,7 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Use Playwright image (already has browsers)
+    # Use Playwright image (has browsers & OS deps)
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
       options: >-
@@ -27,7 +26,8 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      # Keep your current defaults; override via workflow vars/secrets if needed
+
+      # Defaults (override with repo/secret vars if needed)
       BOT_USERNAME: "padelsniper_bot"
       SCAN_DAYS: "45"
       START_HOUR_Z: "5"
@@ -40,19 +40,19 @@ jobs:
       MAX_SLOTS_PER_DATE_SHOWN: "8"
 
     steps:
-      # 1) Checkout main fast
+      # 1) Checkout main repo
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 2) Configure git inside the container (avoid “detected dubious ownership”)
+      # 2) Configure git in the container (avoids “dubious ownership”)
       - name: Configure git identity & safe dir
         run: |
           git config --global user.name "padel-bot"
           git config --global user.email "padel-bot@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      # 3) Ensure padel-state branch exists (bootstrap once)
+      # 3) Ensure padel-state branch exists
       - name: Ensure padel-state branch exists
         shell: bash
         run: |
@@ -72,7 +72,7 @@ jobs:
             echo "padel-state exists on remote."
           fi
 
-      # 4) Pull state branch into side folder (fast)
+      # 4) Pull state branch into a side folder
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -89,24 +89,18 @@ jobs:
           fi
           ls -la state || true
 
-      # 5) Tiny requirements + cache (no playwright install)
-      - name: Write requirements
-        run: |
-          printf "requests>=2.31,<3\n" > requirements.txt
-          cat requirements.txt
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
+      # 5) Install Python deps (Playwright wheel + requests)
+      #    We DO NOT install browsers here – the container already has them.
       - name: Install Python deps
         run: |
-          python --version
-          pip install -r requirements.txt
+          python3 --version
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "playwright==1.47.0" requests
+          python3 - <<'PY'
+import sys, playwright
+print("python:", sys.version.split()[0])
+print("playwright:", playwright.__version__)
+PY
 
       # 6) Run the checker
       - name: Run checker
@@ -115,7 +109,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python checker_pw.py
 
-      # 7) Upload debug screenshots
+      # 7) Upload debug screenshots (if any)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
