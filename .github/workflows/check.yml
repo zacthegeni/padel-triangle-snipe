@@ -2,9 +2,14 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/1 * * * *"
-    - cron: "0 0 1 * *"
+    - cron: "*/1 * * * *"      # every minute
+    - cron: "0 0 1 * *"        # monthly keepalive
   workflow_dispatch: {}
+  # Optional convenience trigger: edit .force-run on main to kick off a run
+  push:
+    branches: [ main ]
+    paths:
+      - ".force-run"
 
 permissions:
   contents: write
@@ -17,19 +22,23 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Use image with browsers & OS deps preinstalled
+    # Use Playwright image (Chromium + system deps preinstalled)
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
     steps:
+      # 1) Checkout code (main)
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # 2) Ensure padel-state branch exists (first-run bootstrap)
       - name: Ensure padel-state branch exists
         working-directory: ${{ github.workspace }}
         run: |
+          # fix "dubious ownership" inside container
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
           git fetch origin --quiet || true
           if git ls-remote --exit-code --heads origin padel-state; then
             echo "padel-state exists on remote."
@@ -47,6 +56,7 @@ jobs:
             git checkout -
           fi
 
+      # 3) Restore state from padel-state into ./state
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -63,24 +73,25 @@ jobs:
           fi
           ls -la state || true
 
-      # Python deps only (container already has browsers & system deps)
+      # 4) Python deps only (container already has browsers & OS deps)
       - name: Install Python deps
         run: |
           python --version
           pip install --upgrade pip
           pip install "playwright==1.47.0" requests
-          # non-fatal import check
           python - <<'PY'
 import importlib, sys
-m = importlib.import_module("playwright")
-print("playwright import OK; executable:", sys.executable)
+importlib.import_module("playwright")
+print("playwright import OK; python:", sys.version.split()[0])
 PY
 
+      # 5) Run checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           BOT_USERNAME: "padelsniper_bot"
+
           SCAN_DAYS: "45"
           START_HOUR_Z: "5"
           EARLIEST_HOUR: "0"
@@ -88,10 +99,12 @@ PY
           WEEKENDS_OK: "true"
           WEEKDAYS_OK: "true"
           ACTIVITY_ID: "149A001015"
+
           NOTIFY_LIMIT_PER_SLOT: "2"
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
+      # 6) Upload debug screenshots (if any)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -100,6 +113,7 @@ PY
           path: debug/*.png
           if-no-files-found: ignore
 
+      # 7) Persist updated state back to padel-state branch
       - name: Persist state to branch
         if: always()
         working-directory: ${{ github.workspace }}/.state_branch
