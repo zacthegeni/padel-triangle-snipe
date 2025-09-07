@@ -2,8 +2,8 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/1 * * * *"
-    - cron: "0 0 1 * *"
+    - cron: "*/1 * * * *"      # every minute
+    - cron: "0 0 1 * *"        # monthly keepalive
   workflow_dispatch: {}
 
 permissions:
@@ -12,17 +12,22 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     concurrency:
       group: padel-watcher
       cancel-in-progress: true
 
+    # Run inside Playwright image → browsers & system deps preinstalled
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
+
     steps:
-      # 1) Checkout your main code
+      # 1) Checkout code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Ensure the state branch exists (bootstrap if missing)
+      # 2) Ensure state branch exists (first-run bootstrap)
       - name: Ensure padel-state branch exists
         run: |
           git fetch origin --quiet || true
@@ -39,10 +44,10 @@ jobs:
             git push origin padel-state
             git checkout -
           else
-            echo "padel-state exists on remote."
+            echo "padel-state exists."
           fi
 
-      # 3) Check out the state branch into a side folder and restore state
+      # 3) Restore state from padel-state branch
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -59,17 +64,14 @@ jobs:
           fi
           ls -la state || true
 
-      # 4) Python + Playwright
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
+      # 4) Python deps only (container already has browsers & OS deps)
+      - name: Install Python deps
         run: |
+          python --version
           pip install --upgrade pip
-          pip install playwright==1.47.0 requests
-          python -m playwright install --with-deps chromium
+          pip install requests  # playwright already present in the container
 
+      # 5) Run checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
@@ -88,6 +90,7 @@ jobs:
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
+      # 6) Upload debug artefacts (optional)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -96,7 +99,7 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 5) Persist state back to padel-state (DB + targets etc.)
+      # 7) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
         run: |
