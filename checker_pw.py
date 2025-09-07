@@ -38,6 +38,7 @@ TARGETS_FP = STATE_DIR / "targets.txt"
 def _db():
     con = sqlite3.connect(DB_FP)
     con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("""
         CREATE TABLE IF NOT EXISTS slot_counts(
           slot_key TEXT PRIMARY KEY,
@@ -149,17 +150,17 @@ def _within_filters(day_dt: dt.date, start_hhmm: str) -> bool:
     return True
 
 def _robust_wait(page):
-    try: page.wait_for_load_state("networkidle", timeout=20000)
+    try: page.wait_for_load_state("domcontentloaded", timeout=10000)
     except PWTimeoutError: pass
-    deadline = dt.datetime.now() + dt.timedelta(seconds=12)
+    deadline = dt.datetime.now() + dt.timedelta(seconds=10)
     while dt.datetime.now() < deadline:
         try:
-            body_txt = page.locator("body").inner_text(timeout=1000)
+            body_txt = page.locator("body").inner_text(timeout=800)
             if TIME_RANGE_RE.search(body_txt): return True
         except Exception: pass
         if page.get_by_role("button", name=BOOK_NAME_RE).count(): return True
         if page.get_by_role("link",   name=BOOK_NAME_RE).count(): return True
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(250)
     return False
 
 def _button_scoped_time(button):
@@ -181,7 +182,8 @@ def _iter_bookable_slots(page, d: dt.date):
     ctas = []
     for loc in (page.get_by_role("button", name=BOOK_NAME_RE),
                 page.get_by_role("link",   name=BOOK_NAME_RE)):
-        for i in range(min(loc.count(), 400)):
+        n = min(loc.count(), 400)
+        for i in range(n):
             el = loc.nth(i)
             try:
                 if not (el.is_visible() and el.is_enabled()): continue
@@ -205,19 +207,60 @@ def _iter_bookable_slots(page, d: dt.date):
     slots.sort(key=lambda x:(x[0],x[2]))
     return slots
 
+# NEW: fast context with request blocking
+BLOCK_HOST_SNIPPETS = (
+    "googletagmanager", "google-analytics", "gtag/js", "facebook", "doubleclick",
+    "hotjar", "clarity", "segment", "optimizely"
+)
+
+def _should_block(url: str, rtype: str) -> bool:
+    if rtype in ("image","media","font","stylesheet"):  # CSS not needed for scraping
+        return True
+    lu = url.lower()
+    return any(s in lu for s in BLOCK_HOST_SNIPPETS)
+
+def _new_context(p):
+    browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+    ctx = browser.new_context(
+        viewport={"width": 1200, "height": 900},
+        locale="en-GB",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120 Safari/537.36 PadelWatcher/1.0",
+        extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
+    )
+    ctx.set_default_timeout(12000)
+    ctx.route("**/*", lambda route: route.abort()
+              if _should_block(route.request.url, route.request.resource_type)
+              else route.continue_())
+    return browser, ctx
+
 def collect_slots():
     today = dt.date.today()
     all_slots = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(); page = ctx.new_page()
+        browser, ctx = _new_context(p)
+        page = ctx.new_page()
         for offset in range(SCAN_DAYS+1):
             d = today + dt.timedelta(days=offset)
-            url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={_zstamp_for_date(d)}&previousActivityDate={_zstamp_for_date(d)}"
-            page.goto(url, timeout=60000)
-            if not _robust_wait(page): continue
+            qs = _zstamp_for_date(d)
+            url = f"{GLAD_BASE}/{ACTIVITY_ID}?activityDate={qs}&previousActivityDate={qs}"
+
+            # Short retry for flaky loads
+            ok = False
+            for attempt in range(2):
+                try:
+                    page.goto(url, timeout=15000, wait_until="domcontentloaded")
+                    ok = _robust_wait(page)
+                    if ok: break
+                except PWTimeoutError:
+                    pass
+            if not ok:
+                continue
+
             all_slots.extend(_iter_bookable_slots(page, d))
+
         ctx.close(); browser.close()
+
     # global de-dupe by (date,time)
     seen, uniq = set(), []
     for s in all_slots:
