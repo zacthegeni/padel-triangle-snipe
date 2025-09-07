@@ -15,7 +15,7 @@ ACTIVITY_ID = os.getenv("ACTIVITY_ID", "149A001015").strip()
 START_HOUR_Z = int(os.getenv("START_HOUR_Z", "5"))
 
 EARLIEST_HOUR = int(os.getenv("EARLIEST_HOUR", "0"))
-LATEST_HOUR   = int(os.getenv("LATEST_HOUR",   "24"))
+LATEST_HOUR   = int(os.getenv("LATEST_HOUR", "24"))
 WEEKENDS_OK   = os.getenv("WEEKENDS_OK", "true").lower() == "true"
 WEEKDAYS_OK   = os.getenv("WEEKDAYS_OK", "true").lower() == "true"
 SCAN_DAYS     = int(os.getenv("SCAN_DAYS", "45"))
@@ -33,14 +33,14 @@ FAST_FORWARD_UPDATES = os.getenv("FAST_FORWARD_UPDATES", "true").lower() == "tru
 # ---------- State (SQLite) ----------
 STATE_DIR = Path("state"); STATE_DIR.mkdir(exist_ok=True)
 DB_FP = STATE_DIR / "slots.sqlite"
-TARGETS_FP = STATE_DIR / "targets.txt"          # simple text list of ISO dates (optional)
+TARGETS_FP = STATE_DIR / "targets.txt"
 
 def _db():
     con = sqlite3.connect(DB_FP)
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("""
         CREATE TABLE IF NOT EXISTS slot_counts(
-          slot_key TEXT PRIMARY KEY,   -- 'YYYY-MM-DD|HH:MM'
+          slot_key TEXT PRIMARY KEY,
           count INTEGER NOT NULL DEFAULT 0,
           last_sent_utc TEXT
         )
