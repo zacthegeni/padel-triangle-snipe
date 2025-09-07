@@ -2,57 +2,82 @@ name: Padel Watcher
 
 on:
   schedule:
-    - cron: "*/1 * * * *"    # every minute
-    - cron: "0 0 1 * *"      # monthly keepalive
+    - cron: "*/1 * * * *"      # every minute
+    - cron: "0 0 1 * *"        # monthly keepalive
   workflow_dispatch: {}
 
+# Least privilege
 permissions:
   contents: write
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     concurrency:
       group: padel-watcher
       cancel-in-progress: true
 
-    # >>> Run inside Playwright image to avoid apt/deps installs <<<
+    # Use Playwright image (already has browsers)
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
+      options: >-
+        --ipc=host
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      # Keep your current defaults; override via workflow vars/secrets if needed
+      BOT_USERNAME: "padelsniper_bot"
+      SCAN_DAYS: "45"
+      START_HOUR_Z: "5"
+      EARLIEST_HOUR: "0"
+      LATEST_HOUR: "24"
+      WEEKENDS_OK: "true"
+      WEEKDAYS_OK: "true"
+      ACTIVITY_ID: "149A001015"
+      NOTIFY_LIMIT_PER_SLOT: "2"
+      MAX_SLOTS_PER_DATE_SHOWN: "8"
 
     steps:
-      # 1) Checkout your main code
+      # 1) Checkout main fast
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      # 2) Ensure padel-state branch exists (bootstrap if missing)
-      - name: Ensure padel-state branch exists
+      # 2) Configure git inside the container (avoid “detected dubious ownership”)
+      - name: Configure git identity & safe dir
         run: |
-          git fetch origin --quiet || true
-          if ! git ls-remote --exit-code --heads origin padel-state; then
+          git config --global user.name "padel-bot"
+          git config --global user.email "padel-bot@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # 3) Ensure padel-state branch exists (bootstrap once)
+      - name: Ensure padel-state branch exists
+        shell: bash
+        run: |
+          set -e
+          git fetch origin +refs/heads/padel-state:refs/remotes/origin/padel-state || true
+          if ! git ls-remote --exit-code --heads origin padel-state >/dev/null 2>&1; then
             echo "Initialising padel-state branch…"
-            git checkout --orphan padel-state
+            git switch --orphan padel-state
             git reset --hard
             mkdir -p state
             echo "Padel state branch" > .padel-state-readme
-            git config user.name "padel-bot"
-            git config user.email "padel-bot@users.noreply.github.com"
             git add .
             git commit -m "init padel-state"
             git push origin padel-state
-            git checkout -
+            git switch -
           else
             echo "padel-state exists on remote."
           fi
 
-      # 3) Pull state branch into a side folder and restore state
+      # 4) Pull state branch into side folder (fast)
       - uses: actions/checkout@v4
         with:
           ref: padel-state
           path: .state_branch
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: true
           clean: false
 
@@ -64,33 +89,33 @@ jobs:
           fi
           ls -la state || true
 
-      # 4) Python deps only (container already has browsers & OS deps)
+      # 5) Tiny requirements + cache (no playwright install)
+      - name: Write requirements
+        run: |
+          printf "requests>=2.31,<3\n" > requirements.txt
+          cat requirements.txt
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install Python deps
         run: |
           python --version
-          pip install --upgrade pip
-          pip install playwright==1.47.0 requests
-          # DO NOT run "playwright install --with-deps" inside the container
+          pip install -r requirements.txt
 
-      # 5) Run the checker
+      # 6) Run the checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          BOT_USERNAME: "padelsniper_bot"
-
-          SCAN_DAYS: "45"
-          START_HOUR_Z: "5"
-          EARLIEST_HOUR: "0"
-          LATEST_HOUR: "24"
-          WEEKENDS_OK: "true"
-          WEEKDAYS_OK: "true"
-          ACTIVITY_ID: "149A001015"
-
-          NOTIFY_LIMIT_PER_SLOT: "2"
-          MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
+      # 7) Upload debug screenshots
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,17 +124,15 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 6) Persist state back to padel-state
+      # 8) Persist state back to padel-state (only if changed)
       - name: Persist state to branch
         if: always()
         run: |
           mkdir -p .state_branch/state
           cp -f state/* .state_branch/state/ 2>/dev/null || true
           cd .state_branch
-          git config user.name "padel-bot"
-          git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
-          git commit -m "update state [skip ci]" || true
+          git diff --quiet --cached || git commit -m "update state [skip ci]"
           git push origin HEAD:padel-state || true
 
   keepalive:
@@ -125,5 +148,5 @@ jobs:
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
           git add .keepalive || true
-          git commit -m "keepalive [skip ci]" || true
+          git diff --quiet --cached || git commit -m "keepalive [skip ci]"
           git push || true
