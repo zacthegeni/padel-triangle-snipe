@@ -17,17 +17,17 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # >>> Run inside Playwright image to avoid apt/deps installs <<<
+    # Use Playwright image -> no apt installs, browsers preinstalled
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
     steps:
-      # 1) Checkout your main code
+      # 1) Checkout main code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Ensure padel-state branch exists (bootstrap if missing)
+      # 2) Ensure the state branch exists (bootstrap if missing)
       - name: Ensure padel-state branch exists
         run: |
           git fetch origin --quiet || true
@@ -43,11 +43,9 @@ jobs:
             git commit -m "init padel-state"
             git push origin padel-state
             git checkout -
-          else
-            echo "padel-state exists on remote."
           fi
 
-      # 3) Pull state branch into a side folder and restore state
+      # 3) Pull state into side folder and restore to ./state
       - uses: actions/checkout@v4
         with:
           ref: padel-state
@@ -69,10 +67,10 @@ jobs:
         run: |
           python --version
           pip install --upgrade pip
-          pip install playwright==1.47.0 requests
-          # DO NOT run "playwright install --with-deps" inside the container
+          pip install requests==2.32.3 playwright==1.47.0
+          # IMPORTANT: do NOT run "playwright install --with-deps"
 
-      # 5) Run the checker
+      # 5) Run checker
       - name: Run checker
         env:
           TG_TOKEN:   ${{ secrets.TG_TOKEN }}
@@ -91,6 +89,7 @@ jobs:
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
+      # 6) Upload debug screenshots (optional)
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,7 +98,7 @@ jobs:
           path: debug/*.png
           if-no-files-found: ignore
 
-      # 6) Persist state back to padel-state
+      # 7) Persist state back to padel-state
       - name: Persist state to branch
         if: always()
         run: |
