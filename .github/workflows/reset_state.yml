@@ -1,0 +1,20 @@
+name: Reset Padel State
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: padel-state
+          fetch-depth: 0
+      - name: Clear state DB
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rm -f state/slots.sqlite
+          git -c user.name="padel-bot" -c user.email="padel-bot@users.noreply.github.com" add -A
+          git -c user.name="padel-bot" -c user.email="padel-bot@users.noreply.github.com" commit -m "reset state [skip ci]" || echo "nothing to commit"
+          git push
