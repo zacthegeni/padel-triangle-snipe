@@ -17,7 +17,7 @@ jobs:
       group: padel-watcher
       cancel-in-progress: true
 
-    # Use Playwright image -> no apt installs, browsers preinstalled
+    # Prebuilt image: browsers & OS deps already installed
     container:
       image: mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
@@ -27,22 +27,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2) Ensure the state branch exists (bootstrap if missing)
+      # 2) Ensure padel-state branch exists (bootstrap if missing)
       - name: Ensure padel-state branch exists
         run: |
+          # Newer git refuses to operate unless the path is marked safe
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
           git fetch origin --quiet || true
-          if ! git ls-remote --exit-code --heads origin padel-state; then
+          if git ls-remote --exit-code --heads origin padel-state; then
+            echo "padel-state exists."
+          else
             echo "Initialising padel-state branch…"
-            git checkout --orphan padel-state
+            git switch --orphan padel-state
             git reset --hard
             mkdir -p state
             echo "Padel state branch" > .padel-state-readme
-            git config user.name "padel-bot"
-            git config user.email "padel-bot@users.noreply.github.com"
-            git add .
-            git commit -m "init padel-state"
-            git push origin padel-state
-            git checkout -
+            git -c user.name="padel-bot" -c user.email="padel-bot@users.noreply.github.com" add .
+            git -c user.name="padel-bot" -c user.email="padel-bot@users.noreply.github.com" commit -m "init padel-state"
+            git push -u origin padel-state
+            git switch -
           fi
 
       # 3) Pull state into side folder and restore to ./state
@@ -68,7 +71,7 @@ jobs:
           python --version
           pip install --upgrade pip
           pip install requests==2.32.3 playwright==1.47.0
-          # IMPORTANT: do NOT run "playwright install --with-deps"
+          # Do NOT run "playwright install --with-deps" in this image
 
       # 5) Run checker
       - name: Run checker
@@ -89,7 +92,7 @@ jobs:
           MAX_SLOTS_PER_DATE_SHOWN: "8"
         run: python checker_pw.py
 
-      # 6) Upload debug screenshots (optional)
+      # 6) Upload debug screenshots
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -105,6 +108,10 @@ jobs:
           mkdir -p .state_branch/state
           cp -f state/* .state_branch/state/ 2>/dev/null || true
           cd .state_branch
+
+          # Mark the separate worktree as safe as well
+          git config --global --add safe.directory "$PWD"
+
           git config user.name "padel-bot"
           git config user.email "padel-bot@users.noreply.github.com"
           git add state/* || true
